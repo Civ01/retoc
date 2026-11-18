@@ -1,5 +1,5 @@
 [workspace]
-members = ["retoc", "retoc_cli"]
+members = ["retoc", "retoc_cli", "iostore"]
 resolver = "2"
 
 [workspace.package]
