@@ -1081,6 +1081,13 @@ pub struct FGuid {
     c: u32,
     d: u32,
 }
+impl FGuid {
+    /// From the 16 bytes as stored (four little-endian u32).
+    pub fn from_bytes(b: [u8; 16]) -> Self {
+        let w = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        Self { a: w(0), b: w(4), c: w(8), d: w(12) }
+    }
+}
 impl Readable for FGuid {
     fn de<S: Read>(stream: &mut S) -> Result<Self> {
         Ok(Self {

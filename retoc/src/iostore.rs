@@ -178,6 +178,19 @@ impl std::hash::Hash for PackageInfo<'_> {
     }
 }
 
+/// Supplies a container's chunk data instead of retoc's own `.ucas` reader (tcl-iostore reads
+/// through the `iostore` crate: partitions, AES, its Oodle search paths).
+pub trait ChunkDataSource: Send + Sync {
+    /// Decoded (decrypted + decompressed) data of the chunk at `toc_index` (TOC entry order).
+    fn read_chunk(&self, toc_index: u32) -> Result<Vec<u8>>;
+}
+
+/// Composite store over the given containers, with the same version checks and priority order
+/// (`_P` patches first) as opening a directory.
+pub fn backend_from_containers(containers: Vec<Box<dyn IoStoreTrait>>) -> Result<Box<dyn IoStoreTrait>> {
+    Ok(Box::new(IoStoreBackend::from_containers(containers)?))
+}
+
 struct IoStoreBackend {
     containers: Vec<Box<dyn IoStoreTrait>>,
 }
@@ -195,6 +208,9 @@ impl IoStoreBackend {
                 containers.push(Box::new(IoStoreContainer::open(path, config.clone())?));
             }
         }
+        Self::from_containers(containers)
+    }
+    fn from_containers(mut containers: Vec<Box<dyn IoStoreTrait>>) -> Result<Self> {
         // Validate that all containers are of the same version
         let mut previous_container_version: Option<EIoStoreTocVersion> = None;
         let mut previous_container_name: String = String::new();
@@ -310,21 +326,30 @@ pub struct IoStoreContainer {
     #[allow(unused)]
     path: PathBuf,
     toc: Toc,
-    cas: FilePool,
+    cas: Option<FilePool>,
+    source: Option<Arc<dyn ChunkDataSource>>,
 
     container_header: Option<FIoContainerHeader>,
 }
 impl IoStoreContainer {
     pub fn open<P: AsRef<Path>>(toc_path: P, config: Arc<Config>) -> Result<Self> {
-        let path = toc_path.as_ref().to_path_buf();
+        Self::open_impl(toc_path.as_ref(), config, None)
+    }
+    /// Opens the TOC; chunk data comes from `source` (the `.ucas` is not opened).
+    pub fn open_with_source<P: AsRef<Path>>(toc_path: P, config: Arc<Config>, source: Arc<dyn ChunkDataSource>) -> Result<Self> {
+        Self::open_impl(toc_path.as_ref(), config, Some(source))
+    }
+    fn open_impl(toc_path: &Path, config: Arc<Config>, source: Option<Arc<dyn ChunkDataSource>>) -> Result<Self> {
+        let path = toc_path.to_path_buf();
         let toc: Toc = BufReader::new(fs::File::open(&path)?).de_ctx(config.clone())?;
-        let cas = FilePool::new(path.with_extension("ucas"), rayon::max_num_threads())?;
+        let cas = if source.is_some() { None } else { Some(FilePool::new(path.with_extension("ucas"), rayon::max_num_threads())?) };
 
         let mut container = Self {
             name: path.file_stem().context("failed to get container name")?.to_string_lossy().into(),
             path,
             toc,
             cas,
+            source,
 
             container_header: None,
         };
@@ -382,7 +407,10 @@ impl IoStoreTrait for IoStoreContainer {
     fn read(&self, chunk_id: FIoChunkId) -> Result<Vec<u8>> {
         let chunk_id = chunk_id.with_version(self.toc.version);
         let index = *self.toc.chunk_id_map.get(&chunk_id).with_context(|| format!("container {:?} does not contain {:?}", self.name, chunk_id))?;
-        let mut file_lock = self.cas.acquire()?;
+        if let Some(source) = &self.source {
+            return source.read_chunk(index).with_context(|| format!("Failed to read chunk {chunk_id:?}"));
+        }
+        let mut file_lock = self.cas.as_ref().context("container has no data file")?.acquire()?;
         self.toc.read(&mut file_lock.file(), index).with_context(|| format!("Failed to read chunk {chunk_id:?}"))
     }
     fn read_raw(&self, chunk_id_raw: FIoChunkIdRaw) -> Result<Vec<u8>> {

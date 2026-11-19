@@ -24,6 +24,8 @@ itertools.workspace = true
 jmap.workspace = true
 rayon.workspace = true
 repak.workspace = true
+# keep the CLI's previous behaviour: download Oodle when it is not found
+oodle_loader = { workspace = true, features = ["download"] }
 ser-hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

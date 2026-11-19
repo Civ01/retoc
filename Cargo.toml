@@ -25,15 +25,16 @@ hex = "0.4.3"
 indexmap = { version = "2.12.0", features = ["serde"] }
 indicatif = "0.18.2"
 itertools = "0.14.0"
-jmap = { git = "https://github.com/trumank/jmap.git", version = "0.1.0" }
+jmap = { git = "https://github.com/trumank/jmap.git", rev = "3ba766e3f2b3035f8c4334ed9598e41122823746", version = "0.1.0" }
 key-mutex = "0.1.3"
 lz4_flex = "0.11.5"
-oodle_loader = { git = "https://github.com/trumank/repak.git", version = "0.2.2" }
+# Civ01/repak: Oodle from search paths, no download unless the `download` feature is on (retoc_cli enables it).
+oodle_loader = { git = "https://github.com/Civ01/repak", branch = "oodle-search-paths", default-features = false }
 pariter = "0.5.1"
 pretty_assertions = "1.4.1"
 rayon = "1.11.0"
-repak = { git = "https://github.com/trumank/repak.git", version = "0.2.2", features = ["oodle"] }
-ser-hex = { git = "https://github.com/trumank/ser-hex.git", version = "0.1.0" }
+repak = { git = "https://github.com/Civ01/repak", branch = "oodle-search-paths", default-features = false, features = ["compression", "encryption", "oodle_core"] }
+ser-hex = { git = "https://github.com/trumank/ser-hex.git", rev = "3d890bb069929e9c9c4c817c433f9b8753c264ed", version = "0.1.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_with = { version = "3.15.1", features = ["hex"] }

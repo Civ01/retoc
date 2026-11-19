@@ -8,6 +8,8 @@ pub enum CompressionMethod {
     Zstd,
     LZ4,
     Oodle,
+    /// UE 5.x `Gzip` (zlib stream with a gzip header).
+    Gzip,
 }
 impl CompressionMethod {
     pub fn from_str_ignore_case(value: &str) -> Option<Self> {
@@ -19,6 +21,11 @@ pub fn compress<S: Write>(compression: CompressionMethod, input: &[u8], mut outp
     match compression {
         CompressionMethod::Zlib => {
             let mut encoder = flate2::write::ZlibEncoder::new(output, flate2::Compression::best());
+            encoder.write_all(input)?;
+            encoder.finish()?;
+        }
+        CompressionMethod::Gzip => {
+            let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::best());
             encoder.write_all(input)?;
             encoder.finish()?;
         }
@@ -42,6 +49,9 @@ pub fn decompress(compression: CompressionMethod, input: &[u8], output: &mut [u8
     match compression {
         CompressionMethod::Zlib => {
             flate2::read::ZlibDecoder::new(input).read_exact(output)?;
+        }
+        CompressionMethod::Gzip => {
+            flate2::read::GzDecoder::new(input).read_exact(output)?;
         }
         CompressionMethod::Zstd => {
             zstd::bulk::decompress_to_buffer(input, output)?;

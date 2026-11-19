@@ -1416,7 +1416,7 @@ fn rebuild_asset_export_data_internal(builder: &LegacyAssetBuilder, raw_exports_
 }
 
 // Serializes an asset into in-memory buffer. Returns each region of the associated asset as a separate buffer
-fn serialize_asset(builder: &LegacyAssetBuilder) -> anyhow::Result<FSerializedAssetBundle> {
+fn serialize_asset(builder: &LegacyAssetBuilder, include_bulk_data: bool) -> anyhow::Result<FSerializedAssetBundle> {
     // Write the asset file first
     let mut asset_file_buffer: Vec<u8> = Vec::new();
     let mut asset_cursor = Cursor::new(&mut asset_file_buffer);
@@ -1437,6 +1437,9 @@ fn serialize_asset(builder: &LegacyAssetBuilder) -> anyhow::Result<FSerializedAs
     let memory_mapped_bulk_data_chunk_id = FIoChunkId::from_package_id(builder.package_id, 0, EIoChunkType::MemoryMappedBulkData);
 
     let store_access: &dyn IoStoreTrait = builder.package_context.store_access;
+    if !include_bulk_data {
+        return Ok(FSerializedAssetBundle { asset_file_buffer, exports_file_buffer, bulk_data_buffer: None, optional_bulk_data_buffer: None, memory_mapped_bulk_data_buffer: None });
+    }
     let bulk_data_buffer = if store_access.has_chunk_id(bulk_data_chunk_id) { Some(store_access.read(bulk_data_chunk_id)?) } else { None };
     let optional_bulk_data_buffer = if store_access.has_chunk_id(optional_bulk_data_chunk_id) { Some(store_access.read(optional_bulk_data_chunk_id)?) } else { None };
     let memory_mapped_bulk_data_buffer = if store_access.has_chunk_id(memory_mapped_bulk_data_chunk_id) { Some(store_access.read(memory_mapped_bulk_data_chunk_id)?) } else { None };
@@ -1451,12 +1454,12 @@ fn serialize_asset(builder: &LegacyAssetBuilder) -> anyhow::Result<FSerializedAs
 }
 
 // Writes asset to the file. Additionally writes to the uexp file next to it
-fn write_asset(builder: &LegacyAssetBuilder, out_asset_path: &UEPath, file_writer: &dyn FileWriterTrait) -> anyhow::Result<()> {
+fn write_asset(builder: &LegacyAssetBuilder, out_asset_path: &UEPath, file_writer: &dyn FileWriterTrait, include_bulk_data: bool) -> anyhow::Result<()> {
     // Dump zen package and legacy package for debugging
     debug!(builder.package_context.log, "{:#?}", builder.zen_package);
     debug!(builder.package_context.log, "{:#?}", builder.legacy_package);
     // Serialize the asset
-    let serialized_asset = serialize_asset(builder)?;
+    let serialized_asset = serialize_asset(builder, include_bulk_data)?;
 
     // Write the asset file
     file_writer.write_file(out_asset_path.to_string(), true, serialized_asset.asset_file_buffer)?;
@@ -1486,6 +1489,15 @@ pub fn build_legacy(package_context: &FZenPackageContext, package_id: FPackageId
     // Build the asset from zen
     let asset_builder = build_asset_from_zen(package_context, package_id)?;
     // Write the asset to the file
-    write_asset(&asset_builder, out_path, file_writer)?;
+    write_asset(&asset_builder, out_path, file_writer, true)?;
+    Ok(())
+}
+
+/// As [`build_legacy`], but writes only the `.uasset`/`.umap` and `.uexp`: the bulk data files
+/// (`.ubulk`, `.uptnl`, `.m.ubulk`) are the bulk chunks' bytes unchanged, so a caller can copy
+/// those itself (streaming) instead of holding them in memory.
+pub fn build_legacy_without_bulk_data(package_context: &FZenPackageContext, package_id: FPackageId, out_path: &UEPath, file_writer: &dyn FileWriterTrait) -> anyhow::Result<()> {
+    let asset_builder = build_asset_from_zen(package_context, package_id)?;
+    write_asset(&asset_builder, out_path, file_writer, false)?;
     Ok(())
 }

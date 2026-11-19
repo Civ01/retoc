@@ -16,5 +16,5 @@ flate2 = "1"
 lz4_flex = "0.11"
 zstd = "0.13"
 thiserror = "2"
-oodle_loader = { git = "https://github.com/Civ01/repak", branch = "oodle-search-paths", default-features = false }
+oodle_loader.workspace = true
 
