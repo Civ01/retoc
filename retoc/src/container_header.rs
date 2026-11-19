@@ -271,6 +271,87 @@ impl FIoContainerHeader {
     pub fn package_ids(&self) -> std::iter::Copied<std::collections::btree_map::Keys<'_, FPackageId, StoreEntry>> {
         self.packages.0.keys().copied()
     }
+
+    /// Soft package references of each package (empty map when the header has none). Decodes
+    /// `PackageIndices`: one (count, offset-from-entry) pair per package in store-entry order, then
+    /// int32 indices into the sorted ID list (IoStoreUtilities.cpp, FSoftPackageReferenceWriter).
+    pub fn soft_references(&self) -> Result<BTreeMap<FPackageId, Vec<FPackageId>>> {
+        let mut out = BTreeMap::new();
+        let Some(refs) = &self.soft_package_references else { return Ok(out) };
+        if refs.package_ids.is_empty() {
+            return Ok(out);
+        }
+        let data = &refs.package_indices;
+        let u32_at = |o: usize| -> Result<u32> { data.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or_else(|| anyhow::anyhow!("soft package references end early")) };
+        for (i, &package) in self.packages.0.keys().enumerate() {
+            let entry = i * 8;
+            let count = u32_at(entry)? as usize;
+            let offset = u32_at(entry + 4)? as usize;
+            let mut list = Vec::with_capacity(count);
+            for k in 0..count {
+                let index = u32_at(entry + offset + k * 4)? as usize;
+                list.push(*refs.package_ids.get(index).ok_or_else(|| anyhow::anyhow!("soft package reference index {index} out of range"))?);
+            }
+            if !list.is_empty() {
+                out.insert(package, list);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Re-encodes the soft references for the current packages (UE's writer layout).
+    fn set_soft_references(&mut self, refs: &BTreeMap<FPackageId, Vec<FPackageId>>) {
+        let mut ids: Vec<FPackageId> = refs.values().flatten().copied().collect::<HashSet<_>>().into_iter().collect();
+        ids.sort();
+        if ids.is_empty() {
+            // UE writes the section empty (flag false) when no package has soft references.
+            self.soft_package_references = None;
+            return;
+        }
+        let n = self.packages.0.len();
+        let mut entries = Vec::with_capacity(n * 8);
+        let mut data = Vec::new();
+        for (i, package) in self.packages.0.keys().enumerate() {
+            let list = refs.get(package).map(Vec::as_slice).unwrap_or(&[]);
+            let offset = if list.is_empty() { 0 } else { (n * 8 - i * 8 + data.len()) as u32 };
+            entries.extend((list.len() as u32).to_le_bytes());
+            entries.extend(offset.to_le_bytes());
+            for r in list {
+                let index = ids.binary_search(r).expect("collected above") as i32;
+                data.extend(index.to_le_bytes());
+            }
+        }
+        entries.extend(data);
+        self.soft_package_references = Some(FIoContainerHeaderSoftPackageReferences { package_ids: ids, package_indices: entries });
+    }
+
+    /// Removes a package's store entry (and its soft references). Returns the entry.
+    pub fn remove_package(&mut self, package_id: FPackageId) -> Result<Option<StoreEntry>> {
+        let mut refs = self.soft_references()?;
+        let removed = self.packages.0.remove(&package_id);
+        if removed.is_some() {
+            refs.remove(&package_id);
+            if self.soft_package_references.is_some() {
+                self.set_soft_references(&refs);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Adds (or replaces) a package's store entry together with its soft references.
+    pub fn add_package_with_soft_references(&mut self, package_id: FPackageId, store_entry: StoreEntry, soft_references: Vec<FPackageId>) -> Result<()> {
+        let mut refs = self.soft_references()?;
+        self.packages.0.insert(package_id, store_entry);
+        if soft_references.is_empty() {
+            refs.remove(&package_id);
+        } else {
+            refs.insert(package_id, soft_references);
+        }
+        if self.soft_package_references.is_some() || !refs.is_empty() {
+            self.set_soft_references(&refs);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, FromRepr, clap::ValueEnum, Serialize, Deserialize)]
@@ -736,5 +817,71 @@ mod test {
         let data = fs::read("tests/UE5.0/ContainerHeader_1.bin")?;
         test_rw_container_header(&data, None)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod soft_reference_edits {
+    use super::*;
+
+    #[test]
+    fn remove_and_add_keep_soft_references_aligned() -> Result<()> {
+        let mut h = FIoContainerHeader::new(EIoContainerHeaderVersion::SoftPackageReferencesOffset, FIoContainerId(7));
+        let p = |n| FPackageId(n);
+        h.add_package_with_soft_references(p(30), StoreEntry::default(), vec![p(900), p(800)])?;
+        h.add_package_with_soft_references(p(10), StoreEntry::default(), vec![])?;
+        h.add_package_with_soft_references(p(20), StoreEntry::default(), vec![p(800)])?;
+        let round = |h: &FIoContainerHeader| -> Result<FIoContainerHeader> {
+            let mut c = Cursor::new(vec![]);
+            h.serialize(&mut c)?;
+            c.set_position(0);
+            FIoContainerHeader::deserialize(&mut c, None)
+        };
+        let back = round(&h)?;
+        let refs = back.soft_references()?;
+        assert_eq!(refs.get(&p(30)), Some(&vec![p(900), p(800)]));
+        assert_eq!(refs.get(&p(20)), Some(&vec![p(800)]));
+        assert!(!refs.contains_key(&p(10)));
+        let mut back = back;
+        assert!(back.remove_package(p(20))?.is_some());
+        let refs = round(&back)?.soft_references()?;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs.get(&p(30)), Some(&vec![p(900), p(800)]));
+        assert!(back.remove_package(p(30))?.is_some());
+        assert!(round(&back)?.soft_package_references.is_none());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sample_round_trip {
+    use super::*;
+
+    /// `CONTAINER_HEADER_SAMPLES`: folder of `*.containerheader` chunks (e.g. from `retoc get`).
+    #[test]
+    fn serialize_is_byte_identical_on_samples() {
+        let Some(dir) = std::env::var_os("CONTAINER_HEADER_SAMPLES") else { return };
+        let (mut same, mut differ) = (0, Vec::new());
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let data = std::fs::read(e.path()).unwrap();
+            let header = FIoContainerHeader::deserialize(&mut Cursor::new(&data), None).unwrap();
+            let mut out = Cursor::new(vec![]);
+            header.serialize(&mut out).unwrap();
+            let mut out = out.into_inner();
+            // Chunks are padded to 16 bytes.
+            out.resize(data.len().max(out.len()), 0);
+            if out == data {
+                same += 1
+            } else {
+                differ.push(e.path().display().to_string())
+            }
+            if let Some(s) = &header.soft_package_references
+                && !s.package_ids.is_empty()
+            {
+                eprintln!("soft refs: {} ids, {} index bytes, {} packages", s.package_ids.len(), s.package_indices.len(), header.packages.0.len());
+            }
+        }
+        eprintln!("{same} identical, {} differ: {differ:?}", differ.len());
+        assert!(differ.is_empty());
     }
 }
