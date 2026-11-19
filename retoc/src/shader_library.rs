@@ -5,7 +5,7 @@ use crate::iostore_writer::IoStoreWriter;
 use crate::logging::Log;
 use crate::ser::{ReadExt, Readable, WriteExt, Writeable};
 use crate::zen::FZenPackageHeader;
-use crate::{EIoChunkType, EIoStoreTocVersion, FIoChunkId, FSHAHash, UEPath};
+use crate::{EIoChunkType, EIoStoreTocVersion, FIoChunkId, FSHAHash, FShaderHash, UEPath};
 use crate::{info, warning};
 use anyhow::{Context as _, anyhow, bail};
 use key_mutex::Empty;
@@ -123,8 +123,8 @@ enum EIoStoreShaderLibraryVersion {
 
 #[derive(Debug, Clone, Default)]
 struct FIoStoreShaderCodeArchiveHeader {
-    shader_map_hashes: Vec<FSHAHash>,
-    shader_hashes: Vec<FSHAHash>,
+    shader_map_hashes: Vec<FShaderHash>,
+    shader_hashes: Vec<FShaderHash>,
     // Referred to as ShaderGroupIoHashes in UE
     shader_group_chunk_ids: Vec<FIoChunkIdRaw>,
     shader_map_entries: Vec<FIoStoreShaderMapEntry>,
@@ -133,9 +133,9 @@ struct FIoStoreShaderCodeArchiveHeader {
     shader_indices: Vec<u32>,
 }
 impl FIoStoreShaderCodeArchiveHeader {
-    fn deserialize<S: Read>(s: &mut S, _version: EIoStoreShaderLibraryVersion) -> anyhow::Result<Self> {
-        let shader_map_hashes: Vec<FSHAHash> = s.de()?;
-        let shader_hashes: Vec<FSHAHash> = s.de()?;
+    fn deserialize<S: Read>(s: &mut S, _version: EIoStoreShaderLibraryVersion, shader_hash_size: usize) -> anyhow::Result<Self> {
+        let shader_map_hashes = FShaderHash::read_vec(s, shader_hash_size)?;
+        let shader_hashes = FShaderHash::read_vec(s, shader_hash_size)?;
         let shader_group_chunk_ids: Vec<FIoChunkIdRaw> = s.de()?;
         let shader_map_entries: Vec<FIoStoreShaderMapEntry> = s.de()?;
         let shader_entries: Vec<FIoStoreShaderCodeEntry> = s.de()?;
@@ -153,8 +153,8 @@ impl FIoStoreShaderCodeArchiveHeader {
         })
     }
     fn serialize<S: Write>(&self, s: &mut S, _version: EIoStoreShaderLibraryVersion) -> anyhow::Result<()> {
-        s.ser(&self.shader_map_hashes)?;
-        s.ser(&self.shader_hashes)?;
+        FShaderHash::write_vec(s, &self.shader_map_hashes)?;
+        FShaderHash::write_vec(s, &self.shader_hashes)?;
         s.ser(&self.shader_group_chunk_ids)?;
         s.ser(&self.shader_map_entries)?;
         s.ser(&self.shader_entries)?;
@@ -231,6 +231,26 @@ pub struct IoStoreShaderCodeArchive {
     total_shader_code_size: usize,
 }
 impl IoStoreShaderCodeArchive {
+    /// The library chunk holds only the header. UE 5.8 shortened the hashes from 20 to 8 bytes
+    /// without a version change: the size that parses the whole chunk consistently wins.
+    fn deserialize_header(data: &[u8], version: EIoStoreShaderLibraryVersion) -> anyhow::Result<FIoStoreShaderCodeArchiveHeader> {
+        let mut first_error = None;
+        for size in [FShaderHash::SHA1_SIZE, FShaderHash::UE5_8_SIZE] {
+            let mut r = Cursor::new(data);
+            r.set_position(4);
+            match FIoStoreShaderCodeArchiveHeader::deserialize(&mut r, version, size) {
+                Ok(h) if r.position() as usize == data.len() && h.shader_hashes.len() == h.shader_entries.len() && h.shader_map_hashes.len() == h.shader_map_entries.len() => return Ok(h),
+                Ok(_) => {
+                    first_error.get_or_insert_with(|| anyhow!("shader library header doesn't parse consistently with {size}-byte hashes"));
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        Err(first_error.unwrap())
+    }
+
     // Reads full IoStore shader code archive
     pub fn read(store_access: &dyn IoStoreTrait, library_chunk_id: FIoChunkId) -> anyhow::Result<IoStoreShaderCodeArchive> {
         // Read shader library header raw data
@@ -240,7 +260,7 @@ impl IoStoreShaderCodeArchive {
         // Deserialize the shader library header and version
         let zen_shader_library_version_raw: u32 = shader_library_reader.de()?;
         let zen_shader_library_version = EIoStoreShaderLibraryVersion::from_repr(zen_shader_library_version_raw).ok_or_else(|| anyhow!("Unknown shader library version: {}", zen_shader_library_version_raw))?;
-        let shader_library_header = FIoStoreShaderCodeArchiveHeader::deserialize(&mut shader_library_reader, zen_shader_library_version)?;
+        let shader_library_header = Self::deserialize_header(&shader_library_header_data, zen_shader_library_version)?;
         let mut compression_method: Option<CompressionMethod> = None;
 
         // Read and decompress individual shader groups belonging to this library, and extract shader code from them
@@ -404,8 +424,8 @@ impl Writeable for FFileCachePreloadEntry {
 }
 #[derive(Debug, Clone, Default)]
 struct FShaderLibraryHeader {
-    shader_map_hashes: Vec<FSHAHash>,
-    shader_hashes: Vec<FSHAHash>,
+    shader_map_hashes: Vec<FShaderHash>,
+    shader_hashes: Vec<FShaderHash>,
     shader_map_entries: Vec<FShaderMapEntry>,
     shader_entries: Vec<FShaderCodeEntry>,
     preload_entries: Vec<FFileCachePreloadEntry>,
@@ -413,18 +433,18 @@ struct FShaderLibraryHeader {
 }
 impl FShaderLibraryHeader {
     fn serialize<S: Write>(&self, s: &mut S) -> anyhow::Result<()> {
-        s.ser(&self.shader_map_hashes)?;
-        s.ser(&self.shader_hashes)?;
+        FShaderHash::write_vec(s, &self.shader_map_hashes)?;
+        FShaderHash::write_vec(s, &self.shader_hashes)?;
         s.ser(&self.shader_map_entries)?;
         s.ser(&self.shader_entries)?;
         s.ser(&self.preload_entries)?;
         s.ser(&self.shader_indices)?;
         Ok(())
     }
-    fn deserialize<S: Read>(s: &mut S) -> anyhow::Result<Self> {
+    fn deserialize<S: Read>(s: &mut S, shader_hash_size: usize) -> anyhow::Result<Self> {
         Ok(Self {
-            shader_map_hashes: s.de()?,
-            shader_hashes: s.de()?,
+            shader_map_hashes: FShaderHash::read_vec(s, shader_hash_size)?,
+            shader_hashes: FShaderHash::read_vec(s, shader_hash_size)?,
             shader_map_entries: s.de()?,
             shader_entries: s.de()?,
             preload_entries: s.de()?,
@@ -612,13 +632,16 @@ fn layout_write_shader_code(shader_library: &IoStoreShaderCodeArchive, compress_
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct ShaderMapToPackageNameListEntry {
     #[serde(rename = "ShaderMapHash")]
-    pub shader_map_hash: FSHAHash,
+    pub shader_map_hash: FShaderHash,
     #[serde(rename = "Assets")]
     pub package_names: Vec<String>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct ShaderAssetInfoFileRoot {
+    /// UE 5.8 writes 2; retoc's earlier output had no version field.
+    #[serde(rename = "AssetInfoVersion", default, skip_serializing_if = "Option::is_none")]
+    pub asset_info_version: Option<u32>,
     #[serde(rename = "ShaderCodeToAssets")]
     pub shader_code_to_assets: Vec<ShaderMapToPackageNameListEntry>,
 }
@@ -637,7 +660,7 @@ pub fn get_shader_asset_info_filename_from_library_filename(shader_library_filen
     Ok(asset_info_filename)
 }
 
-fn build_shader_asset_metadata_from_io_store_packages(store_access: &dyn IoStoreTrait, shader_map_hashes: &HashSet<FSHAHash>, log: &Log) -> (usize, ShaderAssetInfoFileRoot) {
+fn build_shader_asset_metadata_from_io_store_packages(store_access: &dyn IoStoreTrait, shader_map_hashes: &HashSet<FShaderHash>, log: &Log) -> (usize, ShaderAssetInfoFileRoot) {
     let container_header_version = store_access.container_header_version();
 
     // Make sure container header version is actually available first
@@ -645,7 +668,7 @@ fn build_shader_asset_metadata_from_io_store_packages(store_access: &dyn IoStore
         warning!(log, "Skipping shader asset metadata build for shader library because container header version is not present");
         return (0, ShaderAssetInfoFileRoot::default());
     }
-    let mut shader_map_hash_to_package_names: HashMap<FSHAHash, Vec<String>> = HashMap::new();
+    let mut shader_map_hash_to_package_names: HashMap<FShaderHash, Vec<String>> = HashMap::new();
     let mut total_package_references: usize = 0;
 
     // Iterate all packages that reference any shader maps in this library and track their names
@@ -653,7 +676,7 @@ fn build_shader_asset_metadata_from_io_store_packages(store_access: &dyn IoStore
         let package_id = package_info.id();
         if let Some(package_store_entry) = package_info.container().package_store_entry(package_id) {
             // Filter shader map hashes to only the ones actually contained in this shader library
-            let referenced_shader_map_hashes: Vec<FSHAHash> = package_store_entry.shader_map_hashes.iter().filter(|x| shader_map_hashes.contains(x)).cloned().collect();
+            let referenced_shader_map_hashes: Vec<FShaderHash> = package_store_entry.shader_map_hashes.iter().filter(|x| shader_map_hashes.contains(x)).cloned().collect();
 
             // Skip this package if it actually does not reference any shader maps from this shader library. this saves us time reading and parsing its data
             if referenced_shader_map_hashes.is_empty() {
@@ -684,7 +707,7 @@ fn build_shader_asset_metadata_from_io_store_packages(store_access: &dyn IoStore
     }
 
     // Sort to get a predictable order in the resulting JSON file
-    let mut referenced_shader_map_hashes: Vec<FSHAHash> = shader_map_hash_to_package_names.keys().cloned().collect();
+    let mut referenced_shader_map_hashes: Vec<FShaderHash> = shader_map_hash_to_package_names.keys().cloned().collect();
     referenced_shader_map_hashes.sort();
 
     // Create the resulting JSON file structure
@@ -785,8 +808,9 @@ pub fn rebuild_shader_library_from_io_store(store_access: &dyn IoStoreTrait, lib
     let mut result_shader_library_buffer: Vec<u8> = Vec::new();
     let mut result_library_writer = Cursor::new(&mut result_shader_library_buffer);
 
-    // UE4.24 and above is 2, name or what changed unknown
-    let shader_library_version_loose = 2;
+    // UE4.24 and above is 2, name or what changed unknown; UE 5.8 is 3 (8-byte shader hashes)
+    let hash_size = shader_library.shader_hashes.first().or(shader_library.shader_map_hashes.first()).map(|h| h.len()).unwrap_or(FShaderHash::SHA1_SIZE);
+    let shader_library_version_loose: i32 = if hash_size == FShaderHash::UE5_8_SIZE { 3 } else { 2 };
     result_library_writer.ser(&shader_library_version_loose)?;
     // Serialize shader library header
     FShaderLibraryHeader::serialize(&shader_library, &mut result_library_writer)?;
@@ -794,8 +818,11 @@ pub fn rebuild_shader_library_from_io_store(store_access: &dyn IoStoreTrait, lib
     result_library_writer.write_all(&shader_code.shader_code_buffer)?;
 
     // Resolve asset names referencing the shader maps contained in this library
-    let contained_shader_map_hashes: HashSet<FSHAHash> = shader_library.shader_map_hashes.iter().cloned().collect();
-    let (total_package_references, shader_asset_info) = build_shader_asset_metadata_from_io_store_packages(store_access, &contained_shader_map_hashes, log);
+    let contained_shader_map_hashes: HashSet<FShaderHash> = shader_library.shader_map_hashes.iter().cloned().collect();
+    let (total_package_references, mut shader_asset_info) = build_shader_asset_metadata_from_io_store_packages(store_access, &contained_shader_map_hashes, log);
+    if shader_library_version_loose == 3 {
+        shader_asset_info.asset_info_version = Some(2);
+    }
     let result_shader_asset_metadata_buffer = serde_json::to_vec_pretty(&shader_asset_info)?;
 
     // Print shader library statistics to stdout if allowed
@@ -1036,7 +1063,7 @@ fn build_io_store_shader_code_archive_header(shader_library: &FShaderLibraryHead
             let shader_hash = shader_library.shader_hashes[*shader_index];
             io_store_library_header.shader_entries[*shader_index] = FIoStoreShaderCodeEntry::new(shader_group_index, uncompressed_group_size, shader_code_entry.frequency);
 
-            group_hasher.update(shader_hash.0);
+            group_hasher.update(shader_hash.as_bytes());
             group_hasher.update(shader_code_entry.uncompressed_size.to_le_bytes());
             uncompressed_group_size += shader_code_entry.uncompressed_size as usize;
         }
@@ -1059,7 +1086,7 @@ fn build_io_store_shader_code_archive_header(shader_library: &FShaderLibraryHead
     io_store_library_header
 }
 
-pub fn read_shader_asset_info(shader_asset_metadata_buffer: &[u8], package_name_to_shader_maps: &mut HashMap<String, Vec<FSHAHash>>) -> anyhow::Result<()> {
+pub fn read_shader_asset_info(shader_asset_metadata_buffer: &[u8], package_name_to_shader_maps: &mut HashMap<String, Vec<FShaderHash>>) -> anyhow::Result<()> {
     let shader_asset_info: ShaderAssetInfoFileRoot = serde_json::from_slice(shader_asset_metadata_buffer)?;
 
     for shader_map_entry in &shader_asset_info.shader_code_to_assets {
@@ -1075,10 +1102,14 @@ pub fn write_io_store_library(store_writer: &mut IoStoreWriter, raw_shader_libra
 
     // Read shader library header
     let shader_library_version_loose: i32 = shader_library_reader.de()?;
+    if shader_library_version_loose == 3 {
+        // UE 5.8: 8-byte shader hashes and xxHash128 shader group ids; not supported for packing yet
+        bail!("UE 5.8 shader libraries (version 3) can't be converted to IoStore yet");
+    }
     if shader_library_version_loose != 2 {
         bail!("Unknown shader library file version {}. Current version is 2", shader_library_version_loose);
     }
-    let shader_library_header = FShaderLibraryHeader::deserialize(&mut shader_library_reader)?;
+    let shader_library_header = FShaderLibraryHeader::deserialize(&mut shader_library_reader, FShaderHash::SHA1_SIZE)?;
     // Shader library code offsets are relative to the end of the shader library header
     let shader_library_code_start_offset = shader_library_reader.stream_position()?;
     let total_library_compressed_size = raw_shader_library_buffer.len() - shader_library_code_start_offset as usize;
@@ -1219,7 +1250,7 @@ mod test {
         let shader_library_header = ser_hex::read("out/read_container_shader_library.trace.json", &mut stream, |x| {
             let library_version: u32 = x.de()?;
             assert_eq!(library_version, 1, "expected shader library header version to be initial");
-            FIoStoreShaderCodeArchiveHeader::deserialize(x, EIoStoreShaderLibraryVersion::Initial)
+            FIoStoreShaderCodeArchiveHeader::deserialize(x, EIoStoreShaderLibraryVersion::Initial, FShaderHash::SHA1_SIZE)
         })?;
 
         assert_eq!(shader_library_header.shader_group_entries.len(), 535);
@@ -1242,18 +1273,30 @@ mod test {
         Ok(())
     }
 
+    /// UE 5.8: 8-byte shader hashes, same library version 1 (sample: one dummy material).
+    #[test]
+    fn test_read_ue5_8_shader_library_header() -> anyhow::Result<()> {
+        let data = fs::read("tests/UE5.8/ShaderArchive-Moadra_Chunk0-PCD3D_SM5-PCD3D_SM5.uzenshaderbytecode")?;
+        let header = IoStoreShaderCodeArchive::deserialize_header(&data, EIoStoreShaderLibraryVersion::Initial)?;
+        assert_eq!(header.shader_map_hashes.len(), 4);
+        assert_eq!(header.shader_hashes.len(), 36);
+        assert!(header.shader_map_hashes.iter().chain(&header.shader_hashes).all(|h| h.len() == 8));
+        assert!(header.shader_map_hashes.contains(&"57DBA81FE615A083".parse()?));
+        Ok(())
+    }
+
     #[test]
     fn test_zen_shader_library_identity_conversion() -> anyhow::Result<()> {
         // Note that for legacy library only the header is included into the repository, shader code is omitted since it is irrelevant for this test and is very large
         let mut legacy_shader_library_reader = BufReader::new(fs::File::open("tests/UE5.4/ShaderArchive-NuclearNightmare-PCD3D_SM6-PCD3D_SM6.ushaderbytecode")?);
         let legacy_library_version: u32 = legacy_shader_library_reader.de()?;
         assert_eq!(legacy_library_version, 2, "expected legacy shader library header version to be 2");
-        let legacy_shader_library = FShaderLibraryHeader::deserialize(&mut legacy_shader_library_reader)?;
+        let legacy_shader_library = FShaderLibraryHeader::deserialize(&mut legacy_shader_library_reader, FShaderHash::SHA1_SIZE)?;
 
         let mut zen_shader_library_reader = BufReader::new(fs::File::open("tests/UE5.4/ShaderArchive-NuclearNightmare-PCD3D_SM6-PCD3D_SM6.uzenshaderbytecode")?);
         let zen_library_version: u32 = zen_shader_library_reader.de()?;
         assert_eq!(zen_library_version, 1, "expected zen shader library header version to be initial");
-        let original_zen_shader_library = FIoStoreShaderCodeArchiveHeader::deserialize(&mut zen_shader_library_reader, EIoStoreShaderLibraryVersion::Initial)?;
+        let original_zen_shader_library = FIoStoreShaderCodeArchiveHeader::deserialize(&mut zen_shader_library_reader, EIoStoreShaderLibraryVersion::Initial, FShaderHash::SHA1_SIZE)?;
 
         // Check the data that is completely unchanged from legacy to zen lib first
         assert_eq!(legacy_shader_library.shader_hashes, original_zen_shader_library.shader_hashes);

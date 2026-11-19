@@ -1130,6 +1130,101 @@ impl std::fmt::Debug for FSHAHash {
     }
 }
 
+/// Shader and shader map hash: 20 bytes (SHA-1) up to UE 5.7, 8 bytes (u64) from UE 5.8 on.
+/// The size isn't versioned in the formats that store it; readers detect it or are told.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct FShaderHash {
+    bytes: [u8; 20],
+    len: u8,
+}
+impl FShaderHash {
+    pub const SHA1_SIZE: usize = 20;
+    pub const UE5_8_SIZE: usize = 8;
+    pub fn from_slice(b: &[u8]) -> Self {
+        assert!(b.len() == 8 || b.len() == 20, "shader hash must be 8 or 20 bytes");
+        let mut bytes = [0u8; 20];
+        bytes[..b.len()].copy_from_slice(b);
+        Self { bytes, len: b.len() as u8 }
+    }
+    pub fn from_sha(h: FSHAHash) -> Self {
+        Self::from_slice(&h.0)
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len()]
+    }
+    pub fn len(&self) -> usize {
+        if self.len == 0 { 20 } else { self.len as usize }
+    }
+    pub fn read<S: Read>(s: &mut S, size: usize) -> Result<Self> {
+        let mut b = [0u8; 20];
+        s.read_exact(&mut b[..size])?;
+        Ok(Self::from_slice(&b[..size]))
+    }
+    /// `count` hashes of `size` bytes, no length prefix.
+    pub fn read_n<S: Read>(s: &mut S, count: usize, size: usize) -> Result<Vec<Self>> {
+        if count > (1 << 26) {
+            bail!("implausible shader hash count {count}");
+        }
+        (0..count).map(|_| Self::read(s, size)).collect()
+    }
+    /// u32 count, then the hashes.
+    pub fn read_vec<S: Read>(s: &mut S, size: usize) -> Result<Vec<Self>> {
+        let count: u32 = s.de()?;
+        Self::read_n(s, count as usize, size)
+    }
+    pub fn write_vec<S: Write>(s: &mut S, v: &[Self]) -> Result<()> {
+        s.ser(&(v.len() as u32))?;
+        Self::write_n(s, v)
+    }
+    pub fn write_n<S: Write>(s: &mut S, v: &[Self]) -> Result<()> {
+        for h in v {
+            s.write_all(h.as_bytes())?;
+        }
+        Ok(())
+    }
+}
+impl std::fmt::Display for FShaderHash {
+    /// As UE writes it: 8-byte hashes as an uppercase u64, SHA-1 hashes as lowercase hex
+    /// (retoc's existing asset info output).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.len() == 8 {
+            write!(f, "{:016X}", u64::from_le_bytes(self.bytes[..8].try_into().unwrap()))
+        } else {
+            for b in self.as_bytes() {
+                write!(f, "{b:02x}")?;
+            }
+            Ok(())
+        }
+    }
+}
+impl std::fmt::Debug for FShaderHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FShaderHash({self})")
+    }
+}
+impl std::str::FromStr for FShaderHash {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let s = s.trim();
+        match s.len() {
+            16 => Ok(Self::from_slice(&u64::from_str_radix(s, 16)?.to_le_bytes())),
+            40 => Ok(Self::from_slice(&hex::decode(s)?)),
+            n => bail!("shader hash string of {n} characters"),
+        }
+    }
+}
+impl Serialize for FShaderHash {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+impl<'de> Deserialize<'de> for FShaderHash {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 bitflags! {
     #[derive(Debug, Default)]
     pub struct EIoContainerFlags: u8 {

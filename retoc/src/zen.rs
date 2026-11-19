@@ -14,7 +14,7 @@ use crate::script_objects::FPackageObjectIndex;
 use crate::ser::{WriteExt, Writeable};
 use crate::version_heuristics::{heuristic_zen_has_bulk_data, heuristic_zen_package_version};
 use crate::{
-    EIoStoreTocVersion, FGuid, FPackageId, FSHAHash, ReadExt, Readable, align_u64,
+    EIoStoreTocVersion, FGuid, FPackageId, FShaderHash, ReadExt, Readable, align_u64,
     name_map::{FMappedName, FNameMap},
 };
 
@@ -825,7 +825,7 @@ pub struct FZenPackageHeader {
     pub dependency_bundle_entries: Vec<FDependencyBundleEntry>,
     pub imported_package_names: Vec<String>,
     pub imported_packages: Vec<FPackageId>,
-    pub shader_map_hashes: Vec<FSHAHash>,
+    pub shader_map_hashes: Vec<FShaderHash>,
     pub is_unversioned: bool,
     pub internal_dependency_arcs: Vec<FInternalDependencyArc>,
     pub external_package_dependencies: Vec<ExternalPackageDependency>,
@@ -1062,7 +1062,7 @@ impl FZenPackageHeader {
         }
 
         let imported_packages: Vec<FPackageId>;
-        let mut shader_map_hashes: Vec<FSHAHash> = Vec::new();
+        let mut shader_map_hashes: Vec<FShaderHash> = Vec::new();
 
         // Derive information from the store entry directly if it is available
         if let Some(store_entry) = optional_store_entry {

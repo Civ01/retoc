@@ -12,7 +12,7 @@ use tracing::instrument;
 
 use crate::name_map::{EMappedNameType, read_name_batch_parts, write_name_batch_parts};
 use crate::{
-    FIoContainerId, FPackageId, FSHAHash, ReadExt,
+    FIoContainerId, FPackageId, FShaderHash, ReadExt,
     name_map::{FMappedName, FNameMap},
     ser::*,
 };
@@ -415,7 +415,7 @@ pub struct StoreEntry {
     pub export_bundle_count: i32,
 
     pub imported_packages: Vec<FPackageId>,
-    pub shader_map_hashes: Vec<FSHAHash>,
+    pub shader_map_hashes: Vec<FShaderHash>,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -443,6 +443,25 @@ impl StoreEntries {
         };
 
         let entries = read_array(package_ids.len(), &mut cur, |s| FFilePackageStoreEntry::deserialize(s, version))?;
+
+        // Shader map hash size: 20 bytes (SHA-1) up to UE 5.7, 8 bytes from UE 5.8, with no version
+        // change. The arrays follow the entries back to back, so the buffer size tells.
+        let shader_hash_size = if version > EIoContainerHeaderVersion::Initial {
+            let total_hashes: u64 = entries.iter().map(|e| e.shader_map_hashes.array_num as u64).sum();
+            let total_imports: u64 = entries.iter().map(|e| e.imported_packages.array_num as u64).sum();
+            let rest = (cur.get_ref().len() as u64).saturating_sub(entries.len() as u64 * entry_size as u64 + total_imports * 8);
+            if total_hashes == 0 || rest == total_hashes * FShaderHash::SHA1_SIZE as u64 {
+                FShaderHash::SHA1_SIZE
+            } else if rest == total_hashes * FShaderHash::UE5_8_SIZE as u64 {
+                FShaderHash::UE5_8_SIZE
+            } else if rest >= total_hashes * FShaderHash::SHA1_SIZE as u64 {
+                FShaderHash::SHA1_SIZE
+            } else {
+                FShaderHash::UE5_8_SIZE
+            }
+        } else {
+            FShaderHash::SHA1_SIZE
+        };
 
         let entries = entries
             .into_iter()
@@ -474,7 +493,7 @@ impl StoreEntries {
                     new.shader_map_hashes = if num != 0 {
                         let offset = offset + member_offset + entry.shader_map_hashes.offset_to_data_from_this as usize + 8; // offset_of(FFilePackageStoreEntry::shader_map_hashes)
                         cur.seek(SeekFrom::Start(offset as u64))?;
-                        cur.de_ctx(num)?
+                        FShaderHash::read_n(&mut cur, num, shader_hash_size)?
                     } else {
                         vec![]
                     };
@@ -536,7 +555,7 @@ impl StoreEntries {
                 let offset = cur.position() as usize - entry_offset - member_offset - 8;
                 ser_entry.shader_map_hashes.offset_to_data_from_this = offset as u32;
                 ser_entry.shader_map_hashes.array_num = entry.shader_map_hashes.len() as u32;
-                cur.ser_no_length(&entry.shader_map_hashes)?;
+                FShaderHash::write_n(&mut cur, &entry.shader_map_hashes)?;
             }
 
             // advance array_offset
@@ -587,7 +606,7 @@ struct FFilePackageStoreEntry {
     export_bundle_count: i32,
 
     imported_packages: TFilePackageStoreEntryCArrayView<FPackageId>,
-    shader_map_hashes: TFilePackageStoreEntryCArrayView<FSHAHash>,
+    shader_map_hashes: TFilePackageStoreEntryCArrayView<FShaderHash>,
 }
 impl FFilePackageStoreEntry {
     #[instrument(skip_all, name = "FFilePackageStoreEntry")]

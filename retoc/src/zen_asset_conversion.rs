@@ -10,7 +10,7 @@ use crate::zen::{
     EExportCommandType, EExportFilterFlags, EObjectFlags, EZenPackageVersion, ExternalPackageDependency, FBulkDataMapEntry, FCellExportMapEntry, FDependencyBundleEntry, FDependencyBundleHeader, FExportBundleEntry, FExportBundleHeader, FExportMapEntry, FExternalDependencyArc, FInternalDependencyArc,
     FPackageFileVersion, FPackageIndex, FZenPackageHeader, FZenPackageVersioningInfo, ZenScriptCellsStore,
 };
-use crate::{EIoChunkType, FIoChunkId, FPackageId, FSHAHash, UEPath, UEPathBuf};
+use crate::{EIoChunkType, FIoChunkId, FPackageId, FShaderHash, UEPath, UEPathBuf};
 use crate::{debug, warning};
 use anyhow::{Context, anyhow, bail};
 use byteorder::{LE, ReadBytesExt};
@@ -1119,7 +1119,7 @@ fn serialize_zen_asset(builder: &ZenPackageBuilder, legacy_asset_bundle: &FSeria
     Ok((result_store_entry, result_package_buffer, legacy_external_arcs_serialized_offsets))
 }
 
-fn build_converted_zen_asset(builder: &ZenPackageBuilder, legacy_asset_bundle: FSerializedAssetBundle, path: &UEPath, package_name_to_referenced_shader_maps: &HashMap<String, Vec<FSHAHash>>) -> anyhow::Result<ConvertedZenAssetBundle> {
+fn build_converted_zen_asset(builder: &ZenPackageBuilder, legacy_asset_bundle: FSerializedAssetBundle, path: &UEPath, package_name_to_referenced_shader_maps: &HashMap<String, Vec<FShaderHash>>) -> anyhow::Result<ConvertedZenAssetBundle> {
     let (mut result_store_entry, result_package_buffer, legacy_external_arc_serialized_offsets) = serialize_zen_asset(builder, &legacy_asset_bundle)?;
 
     let package_name = builder.source_package_name.as_ref().unwrap_or(&builder.legacy_package.summary.package_name).clone();
@@ -1317,7 +1317,7 @@ fn build_zen_asset_internal<'a>(
 // Builds zen asset and writes it into the container using the provided serialized legacy asset and package version
 pub fn build_zen_asset(
     legacy_asset: FSerializedAssetBundle,
-    package_name_to_referenced_shader_maps: &HashMap<String, Vec<FSHAHash>>,
+    package_name_to_referenced_shader_maps: &HashMap<String, Vec<FShaderHash>>,
     path: &UEPath,
     package_version_fallback: Option<FPackageFileVersion>,
     container_header_version: EIoContainerHeaderVersion,

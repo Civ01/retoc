@@ -19,9 +19,15 @@ pub enum EngineVersion {
     UE5_5,
     UE5_6,
     UE5_7,
+    /// Same package/container formats as 5.7; 8-byte shader hashes, legacy shader library v3.
+    UE5_8,
 }
 
 impl EngineVersion {
+    /// Size of shader and shader map hashes (container header, shader libraries).
+    pub fn shader_hash_size(self) -> usize {
+        if self >= UE5_8 { crate::FShaderHash::UE5_8_SIZE } else { crate::FShaderHash::SHA1_SIZE }
+    }
     pub fn toc_version(self) -> EIoStoreTocVersion {
         use EIoStoreTocVersion::*;
         match self {
@@ -36,6 +42,7 @@ impl EngineVersion {
             UE5_5 => ReplaceIoChunkHashWithIoHash,
             UE5_6 => ReplaceIoChunkHashWithIoHash,
             UE5_7 => ReplaceIoChunkHashWithIoHash,
+            UE5_8 => ReplaceIoChunkHashWithIoHash,
         }
     }
     pub fn container_header_version(self) -> EIoContainerHeaderVersion {
@@ -52,6 +59,7 @@ impl EngineVersion {
             UE5_5 => SoftPackageReferences,
             UE5_6 => SoftPackageReferencesOffset,
             UE5_7 => SoftPackageReferencesOffset,
+            UE5_8 => SoftPackageReferencesOffset,
         }
     }
     pub fn object_ue4_version(self) -> EUnrealEngineObjectUE4Version {
@@ -74,6 +82,7 @@ impl EngineVersion {
             UE5_5 => AssetRegistryPackageBuildDependencies,
             UE5_6 => OsSubObjectShadowSerialization,
             UE5_7 => ImportTypeHierarchies,
+            UE5_8 => ImportTypeHierarchies,
             _ => unreachable!(),
         }
     }

@@ -17,7 +17,7 @@ use retoc::version::EngineVersion;
 use retoc::zen::{FPackageFileVersion, FZenPackageHeader, VerseScriptCell, get_package_name};
 use retoc::zen_asset_conversion::{self, ConvertedZenAssetBundle};
 use retoc::{
-    AesKey, Config, EIoChunkType, EIoStoreTocVersion, FGuid, FIoChunkId, FIoChunkIdRaw, FPackageId, FSFileReader, FSFileWriter, FSHAHash, FileReaderTrait, FileWriterTrait, NullFileWriter, PackageTestMetadata, PakFileReader, ParallelPakWriter, Toc, UEPath, UEPathBuf, build_verse_cell_store, info,
+    AesKey, Config, EIoChunkType, EIoStoreTocVersion, FGuid, FIoChunkId, FIoChunkIdRaw, FPackageId, FSFileReader, FSFileWriter, FShaderHash, FileReaderTrait, FileWriterTrait, NullFileWriter, PackageTestMetadata, PakFileReader, ParallelPakWriter, Toc, UEPath, UEPathBuf, build_verse_cell_store, info,
     iostore, manifest, verbose,
 };
 use std::borrow::Cow;
@@ -812,7 +812,7 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     }
 
     // Convert shader libraries first, since the data contained in their asset metadata is needed to build the package store entries
-    let mut package_name_to_referenced_shader_maps: HashMap<String, Vec<FSHAHash>> = HashMap::new();
+    let mut package_name_to_referenced_shader_maps: HashMap<String, Vec<FShaderHash>> = HashMap::new();
     for path in shader_lib_paths {
         info!(&log, "converting shader library {path}");
         let shader_library_buffer = input.read(path)?;
