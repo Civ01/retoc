@@ -1370,4 +1370,7 @@ pub const ENGINE_PACKAGE_NAME: &str = "/Script/Engine";
 pub const OBJECT_CLASS_NAME: &str = "Object";
 pub const CLASS_CLASS_NAME: &str = "Class";
 pub const PACKAGE_CLASS_NAME: &str = "Package";
+pub const FUNCTION_CLASS_NAME: &str = "Function";
+pub const SCRIPT_STRUCT_CLASS_NAME: &str = "ScriptStruct";
+pub const ENUM_CLASS_NAME: &str = "Enum";
 pub const PRESTREAM_PACKAGE_CLASS_NAME: &str = "PrestreamPackage";

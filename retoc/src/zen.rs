@@ -327,6 +327,7 @@ pub enum EObjectFlags {
     Transactional = 0x00000008,
     ClassDefaultObject = 0x00000010,
     ArchetypeObject = 0x00000020,
+    Transient = 0x00000040,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

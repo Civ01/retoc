@@ -1,8 +1,8 @@
 use crate::container_header::EIoContainerHeaderVersion;
 use crate::iostore::IoStoreTrait;
 use crate::legacy_asset::{
-    CLASS_CLASS_NAME, CORE_OBJECT_PACKAGE_NAME, FCellExport, FCellImport, FLegacyPackageFileSummary, FLegacyPackageHeader, FLegacyPackageVersioningInfo, FObjectDataResource, FObjectExport, FObjectImport, FPackageNameMap, FSerializedAssetBundle, OBJECT_CLASS_NAME, PACKAGE_CLASS_NAME,
-    PRESTREAM_PACKAGE_CLASS_NAME,
+    CLASS_CLASS_NAME, CORE_OBJECT_PACKAGE_NAME, ENUM_CLASS_NAME, FCellExport, FCellImport, FLegacyPackageFileSummary, FLegacyPackageHeader, FLegacyPackageVersioningInfo, FObjectDataResource, FObjectExport, FMinimalName, FObjectImport, FPackageNameMap, FSerializedAssetBundle, FUNCTION_CLASS_NAME, OBJECT_CLASS_NAME, PACKAGE_CLASS_NAME,
+    PRESTREAM_PACKAGE_CLASS_NAME, SCRIPT_STRUCT_CLASS_NAME,
 };
 use crate::logging::Log;
 use crate::name_map::FMappedName;
@@ -28,6 +28,8 @@ pub struct FZenPackageContext<'a> {
     script_cells: Option<Arc<ZenScriptCellsStore>>,
     /// Legacy imports get `PackageName` in cooked packages (UE 5.8+).
     cooked_import_package_names: bool,
+    /// Guess `ScriptStruct`/`Enum` for top-level script imports by name (see `resolve_script_import`).
+    guess_script_type_classes: bool,
 
     inner_state: Arc<RwLock<FZenPackageContextMutableState>>,
     script_objects: Arc<RwLock<Option<FZenPackageContextScriptObjects>>>,
@@ -54,6 +56,7 @@ impl<'a> FZenPackageContext<'a> {
             log,
             script_cells,
             cooked_import_package_names: false,
+            guess_script_type_classes: false,
             script_objects: Default::default(),
             inner_state: Default::default(),
             package_lookup_locks: KeyMutex::new(),
@@ -64,6 +67,15 @@ impl<'a> FZenPackageContext<'a> {
     /// (5.8 writes `PackageName` into cooked imports; 5.7 doesn't, same object version).
     pub fn with_engine_version(mut self, engine_version: Option<crate::version::EngineVersion>) -> Self {
         self.cooked_import_package_names = engine_version.is_some_and(|v| v >= crate::version::EngineVersion::UE5_8);
+        self
+    }
+    /// Top-level script imports that are neither packages, classes nor delegate signatures are
+    /// a `ScriptStruct` or an `Enum`, and Zen doesn't say which. Off: write `Object` (always
+    /// found by the legacy loader). On: `Enum` for `E` + uppercase letter, else `ScriptStruct`;
+    /// right for most names, but a wrong guess makes the legacy loader fail that import
+    /// (it looks imports up by class), e.g. engine enums `ACLCompressionLevel`, `TextureGroup`.
+    pub fn with_script_type_class_guess(mut self, guess: bool) -> Self {
+        self.guess_script_type_classes = guess;
         self
     }
     fn get_script_objects(&self) -> anyhow::Result<RwLockReadGuard<'_, Option<FZenPackageContextScriptObjects>>> {
@@ -294,17 +306,36 @@ fn resolve_script_import(package_cache: &FZenPackageContext, import: FPackageObj
         });
     }
 
-    // This is not a CDO object, not a UClass, and not a UPackage
-    // This could be a UFunction or UScriptStruct if it's top level, UFunction if it's child of UClass, or completely anything if it's child of a CDO
-    // Since we cannot differentiate between these cases, the safest class name to emit for the import is /Script/CoreUObject.Object
-    // The class for import must adhere to the type of the imported object, which Object always does, and in runtime the game does not need that precise of an information
-    // of the import class to resolve native imports.
+    // This is not a CDO object, not a UClass, and not a UPackage. The legacy loader looks native
+    // imports up by class (an object of another class is not found), so only name a precise
+    // class where it can't be wrong, and fall back to /Script/CoreUObject.Object, which every
+    // object is.
+    let class_name = script_import_class_name(&resolved_outer_import, &object_name, package_cache.guess_script_type_classes);
     Ok(ResolvedZenImport {
         class_package: CORE_OBJECT_PACKAGE_NAME.to_string(),
-        class_name: OBJECT_CLASS_NAME.to_string(),
+        class_name: class_name.to_string(),
         outer: Some(Box::new(resolved_outer_import)),
         object_name,
     })
+}
+
+/// Class of a script import that is not a package, class or CDO, from where it sits.
+/// - Inside a native class: always a `Function` (properties are FProperty, not UObjects; class
+///   default subobjects sit under the CDO, not the class).
+/// - Top level ending in `__DelegateSignature`: a `Function` (UHT's name for delegate signatures).
+/// - Other top level: `ScriptStruct` or `Enum`; guessed by name only when asked, else `Object`.
+/// - Anything else (CDO subobjects, ...): `Object`.
+fn script_import_class_name(outer: &ResolvedZenImport, object_name: &str, guess_type_classes: bool) -> &'static str {
+    let outer_is_package = outer.outer.is_none();
+    let outer_is_class = outer.class_name == CLASS_CLASS_NAME && outer.class_package == CORE_OBJECT_PACKAGE_NAME;
+    if outer_is_class || (outer_is_package && object_name.ends_with("__DelegateSignature")) {
+        FUNCTION_CLASS_NAME
+    } else if outer_is_package && guess_type_classes {
+        let mut chars = object_name.chars();
+        if chars.next() == Some('E') && chars.next().is_some_and(|c| c.is_ascii_uppercase()) { ENUM_CLASS_NAME } else { SCRIPT_STRUCT_CLASS_NAME }
+    } else {
+        OBJECT_CLASS_NAME
+    }
 }
 fn resolve_package_import(package_cache: &FZenPackageContext, package_header: &FZenPackageHeader, import: FPackageObjectIndex) -> anyhow::Result<ResolvedZenImport> {
     // Use new resolution logic (using public export hashes) on UE5.0 and above
@@ -737,6 +768,18 @@ fn build_import_map(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
     }
     Ok(())
 }
+/// Whether a legacy class index is `/Script/CoreUObject.Class` itself (not an asset; see `build_export_map`).
+fn is_plain_uclass(builder: &LegacyAssetBuilder, class_index: FPackageIndex) -> bool {
+    if !class_index.is_import() {
+        return false;
+    }
+    let names = &builder.legacy_package.name_map;
+    let Some(import) = builder.legacy_package.imports.get(class_index.to_import_index() as usize) else { return false };
+    let is = |name: FMinimalName, value: &str| names.get(name).is_ok_and(|n| n == value);
+    is(import.object_name, CLASS_CLASS_NAME)
+        && import.outer_index.is_import()
+        && builder.legacy_package.imports.get(import.outer_index.to_import_index() as usize).is_some_and(|outer| is(outer.object_name, CORE_OBJECT_PACKAGE_NAME))
+}
 fn build_export_map(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
     builder.legacy_package.exports.reserve(builder.zen_package.export_map.len());
 
@@ -773,9 +816,13 @@ fn build_export_map(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
         let is_inherited_instance = false;
         // Assume that object does not need load for editor game. This is true for the vast majority of objects, and does not affect the asset in runtime.
         let is_not_always_loaded_for_editor_game = false;
-        // This is not used in runtime, and this information is not preserved by zen. However, we can infer this pretty reliably: Top-level exports marked as RF_Public | RF_Standalone | RF_Transactional are always assets
-        let asset_object_flags: u32 = (EObjectFlags::Public as u32) | (EObjectFlags::Standalone as u32) | (EObjectFlags::Transactional as u32);
-        let is_asset = zen_export.outer_index.is_null() && (object_flags & asset_object_flags) == asset_object_flags;
+        // Not used by the runtime loader and not preserved by zen, but read by tools and by editors loading cooked content.
+        // UObject::IsAsset: public, not a CDO, not transient, outer is the package. UClass::IsAsset is false, but
+        // Blueprint-generated (and Verse) classes override it back, and only those can be exports of a cooked package.
+        let is_asset = zen_export.outer_index.is_null()
+            && (object_flags & (EObjectFlags::Public as u32)) != 0
+            && (object_flags & ((EObjectFlags::ClassDefaultObject as u32) | (EObjectFlags::Transient as u32))) == 0
+            && !is_plain_uclass(builder, class_index);
         // This is false for all objects in the engine presently, but we can infer if it should be true: If export is not marked as RF_Public still has an export hash, generate_public_hash must be true
         // Note that this property did not exist before UE5.0, so it is always false on earlier versions
         let generate_public_hash = builder.zen_package.container_header_version >= EIoContainerHeaderVersion::LocalizedPackages && (object_flags & (EObjectFlags::Public as u32)) == 0 && zen_export.is_public_export();
@@ -1510,4 +1557,34 @@ pub fn build_legacy_without_bulk_data(package_context: &FZenPackageContext, pack
     let asset_builder = build_asset_from_zen(package_context, package_id)?;
     write_asset(&asset_builder, out_path, file_writer, false)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod script_import_class_tests {
+    use super::*;
+
+    fn import(class_name: &str, object_name: &str, outer: Option<ResolvedZenImport>) -> ResolvedZenImport {
+        ResolvedZenImport { class_package: CORE_OBJECT_PACKAGE_NAME.to_string(), class_name: class_name.to_string(), object_name: object_name.to_string(), outer: outer.map(Box::new) }
+    }
+
+    // Cases from the engine's own cook of BP_SML (UE 5.8) plus engine enums without an E prefix.
+    #[test]
+    fn classes_match_the_engine_where_certain() {
+        let engine = || import(PACKAGE_CLASS_NAME, "/Script/Engine", None);
+        let kismet = import(CLASS_CLASS_NAME, "KismetSystemLibrary", Some(engine()));
+        let cdo = import("GameInstance", "Default__GameInstance", Some(engine()));
+        for guess in [false, true] {
+            assert_eq!(script_import_class_name(&kismet, "PrintString", guess), FUNCTION_CLASS_NAME);
+            assert_eq!(script_import_class_name(&engine(), "OnSomething__DelegateSignature", guess), FUNCTION_CLASS_NAME);
+            assert_eq!(script_import_class_name(&cdo, "SceneComponent", guess), OBJECT_CLASS_NAME);
+        }
+        // Struct or enum: unknown unless guessing.
+        assert_eq!(script_import_class_name(&engine(), "TimerHandle", false), OBJECT_CLASS_NAME);
+        assert_eq!(script_import_class_name(&engine(), "EEndPlayReason", false), OBJECT_CLASS_NAME);
+        assert_eq!(script_import_class_name(&engine(), "TimerHandle", true), SCRIPT_STRUCT_CLASS_NAME);
+        assert_eq!(script_import_class_name(&engine(), "EEndPlayReason", true), ENUM_CLASS_NAME);
+        assert_eq!(script_import_class_name(&engine(), "Engine", true), SCRIPT_STRUCT_CLASS_NAME);
+        // Known wrong guess (an enum): why guessing is opt-in.
+        assert_eq!(script_import_class_name(&engine(), "ACLCompressionLevel", true), SCRIPT_STRUCT_CLASS_NAME);
+    }
 }
