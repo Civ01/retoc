@@ -192,6 +192,25 @@ impl ChunkId {
     pub fn hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
+    /// `FIoChunkId` from its 24-digit hex form.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        if s.len() != 24 || !s.is_ascii() {
+            return None;
+        }
+        let mut b = [0u8; 12];
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(Self(b))
+    }
+    /// `CreateIoChunkId(id, index, type)`: 8-byte id, 2-byte index (big endian), 1 byte padding, type.
+    pub fn create(id: u64, index: u16, kind: ChunkKind, version: TocVersion) -> Option<Self> {
+        let mut b = [0u8; 12];
+        b[..8].copy_from_slice(&id.to_le_bytes());
+        b[8..10].copy_from_slice(&index.to_be_bytes());
+        b[11] = kind.code(version)?;
+        Some(Self(b))
+    }
 }
 
 /// `EIoChunkType` (both numberings).
@@ -260,11 +279,34 @@ impl ChunkKind {
         }
     }
 
+    /// The type byte for this kind in a container of `version` (`None` if that numbering has no such type).
+    pub fn code(self, version: TocVersion) -> Option<u8> {
+        (0..=255u8).find(|&c| Self::from_code(c, version) == self && !matches!(self, ChunkKind::Unknown(_)))
+    }
+
     /// Name used in listings, e.g. `<chunkid>.ContainerHeader`.
     pub fn name(&self) -> String {
         match self {
             ChunkKind::Unknown(c) => format!("Type{c}"),
             other => format!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod chunk_id_tests {
+    use super::*;
+
+    #[test]
+    fn create_and_codes() {
+        let v5 = TocVersion(8);
+        let v3 = TocVersion(3);
+        assert_eq!(ChunkKind::ContainerHeader.code(v5), Some(6));
+        assert_eq!(ChunkKind::ContainerHeader.code(v3), Some(10));
+        assert_eq!(ChunkKind::ScriptObjects.code(v3), None);
+        let id = ChunkId::create(0x1122_3344_5566_7788, 0, ChunkKind::ContainerHeader, v5).unwrap();
+        assert_eq!(id.hex(), "887766554433221100000006");
+        assert_eq!(ChunkId::from_hex(&id.hex()), Some(id));
+        assert_eq!(ChunkId::from_hex("zz"), None);
     }
 }

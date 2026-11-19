@@ -413,6 +413,33 @@ impl ContainerEdit {
         Ok(())
     }
 
+    /// Changes the mount point; every named chunk's path is re-expressed relative to it (each must
+    /// lie under it). Rebuilds the directory index on finish.
+    pub fn set_mount_point(&mut self, mount: &str) -> Result<()> {
+        let old = self.mount_point.clone().ok_or_else(|| Error::Write("the container has no directory index".into()))?;
+        if old == mount {
+            return Ok(());
+        }
+        let mut new_paths = Vec::with_capacity(self.entries.len());
+        for e in &self.entries {
+            new_paths.push(match &e.path {
+                Some(p) => {
+                    let full = format!("{old}{p}");
+                    let rel = strip_prefix_ignore_case(&full, mount).ok_or_else(|| Error::Write(format!("{full} is not under the mount point {mount}")))?;
+                    Some(rel.to_string())
+                }
+                None => None,
+            });
+        }
+        for (e, p) in self.entries.iter_mut().zip(new_paths) {
+            e.path = p;
+        }
+        self.mount_point = Some(mount.to_string());
+        self.chunk_set_changed = true;
+        self.dirty = true;
+        Ok(())
+    }
+
     /// The new `.utoc` bytes (nothing is written).
     pub fn build_toc(&self) -> Result<Vec<u8>> {
         let mut toc = self.toc.clone();
@@ -584,4 +611,9 @@ impl UndoRecord {
         }
         Ok(())
     }
+}
+
+/// `s` without `prefix` (ASCII case-insensitive, as UE compares paths).
+pub fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    (s.len() >= prefix.len() && s.is_char_boundary(prefix.len()) && s[..prefix.len()].eq_ignore_ascii_case(prefix)).then(|| &s[prefix.len()..])
 }
