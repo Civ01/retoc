@@ -8,6 +8,7 @@ pub mod file_pool;
 pub mod iostore;
 pub mod iostore_writer;
 pub mod legacy_asset;
+pub mod legacy_summary_fixups;
 pub mod logging;
 pub mod manifest;
 pub mod name_map;

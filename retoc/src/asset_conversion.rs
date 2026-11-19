@@ -9,7 +9,7 @@ use crate::name_map::FMappedName;
 use crate::script_objects::{FPackageObjectIndex, FPackageObjectIndexType, FScriptObjectEntry, ZenScriptObjects};
 use crate::ser::{ReadExt, Utf8String, WriteExt};
 use crate::verse_vm_types::VPackage;
-use crate::zen::{EExportCommandType, EExportFilterFlags, EObjectFlags, FCellExportMapEntry, FExportMapEntry, FExternalDependencyArc, FInternalDependencyArc, FPackageFileVersion, FPackageIndex, FZenPackageHeader, FZenPackageVersioningInfo, ZenScriptCellsStore};
+use crate::zen::{EExportCommandType, EExportFilterFlags, EObjectFlags, EUnrealEngineObjectUE5Version, FCellExportMapEntry, FExportMapEntry, FExternalDependencyArc, FInternalDependencyArc, FPackageFileVersion, FPackageIndex, FZenPackageHeader, FZenPackageVersioningInfo, ZenScriptCellsStore};
 use crate::zen_asset_conversion::get_cell_export_hash;
 use crate::{EIoChunkType, FGuid, FIoChunkId, FPackageId, FileWriterTrait, UEPath};
 use crate::{debug, info, verbose, warning};
@@ -527,7 +527,7 @@ fn begin_build_summary(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
     legacy_package_summary.package_name = builder.zen_package.name_map.get(builder.zen_package.summary.name).to_string();
     legacy_package_summary.package_flags = builder.zen_package.summary.package_flags;
     legacy_package_summary.package_guid = FGuid { a: 0, b: 0, c: 0, d: 0 };
-    legacy_package_summary.package_source = 0;
+    legacy_package_summary.package_source = crate::legacy_summary_fixups::package_source(&legacy_package_summary.package_name);
     legacy_package_summary.cooked_import_package_names = builder.package_context.cooked_import_package_names;
 
     let zen_versions: FZenPackageVersioningInfo = builder.zen_package.versioning_info.clone();
@@ -822,9 +822,9 @@ fn build_export_map(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
         // Note that this property did not exist before UE5.0, so it is always false on earlier versions
         let generate_public_hash = builder.zen_package.container_header_version >= EIoContainerHeaderVersion::LocalizedPackages && (object_flags & (EObjectFlags::Public as u32)) == 0 && zen_export.is_public_export();
 
-        // There is no real way to safely infer these from the zen package. They are only used in the editor for loading assets of undefined types to try and salvage as much data out of them as possible when using versioned serialization
-        // Providing incorrect values here will crash the editor in such a case because of the serial size mismatch. However, we can make an assumption that the entire export is only script properties, and nothing else
-        // In that case, script_serialization_start_offset = 0 which would be the start of the export, and script_serialization_end_offset = serial_size, which would be the entire export
+        // Not preserved by zen. FLinkerLoad checkf's them against the real positions when loading packages with tagged properties,
+        // so serialize_asset replaces these with the real range of the export's tagged properties where it can find it
+        // (fix_script_serialization_offsets). Fallback: assume the entire export is script properties.
         let script_serialization_start_offset: i64 = 0;
         let script_serialization_end_offset: i64 = serial_size;
 
@@ -1469,11 +1469,6 @@ fn rebuild_asset_export_data_internal(builder: &LegacyAssetBuilder, raw_exports_
 
 // Serializes an asset into in-memory buffer. Returns each region of the associated asset as a separate buffer
 fn serialize_asset(builder: &LegacyAssetBuilder, include_bulk_data: bool) -> anyhow::Result<FSerializedAssetBundle> {
-    // Write the asset file first
-    let mut asset_file_buffer: Vec<u8> = Vec::new();
-    let mut asset_cursor = Cursor::new(&mut asset_file_buffer);
-    FLegacyPackageHeader::serialize(&builder.legacy_package, &mut asset_cursor, Some(builder.zen_package.summary.cooked_header_size as usize), builder.package_context.log)?;
-
     // Copy the raw export data from the chunk into the exports file
     let raw_exports_data = builder.package_context.read_full_package_data(builder.package_id)?;
     let exports_file_buffer = if builder.needs_to_rebuild_exports_data {
@@ -1483,6 +1478,20 @@ fn serialize_asset(builder: &LegacyAssetBuilder, include_bulk_data: bool) -> any
         // Otherwise we just need to strip the zen header from the exports
         raw_exports_data[builder.zen_package.summary.header_size as usize..].to_vec()
     };
+
+    // Then the asset file, with the fields that need the export data
+    let mut legacy_package = builder.legacy_package.clone();
+    if !builder.needs_to_rebuild_exports_data {
+        fix_script_serialization_offsets(&mut legacy_package, &exports_file_buffer);
+    }
+    let mut asset_file_buffer: Vec<u8> = Vec::new();
+    let mut asset_cursor = Cursor::new(&mut asset_file_buffer);
+    FLegacyPackageHeader::serialize(&legacy_package, &mut asset_cursor, Some(builder.zen_package.summary.cooked_header_size as usize), builder.package_context.log)?;
+    if legacy_package.summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::PackageSavedHash as i32 {
+        use crate::legacy_summary_fixups::{SAVED_HASH_OFFSET, saved_hash};
+        let hash = saved_hash(&asset_file_buffer, &exports_file_buffer);
+        asset_file_buffer[SAVED_HASH_OFFSET..SAVED_HASH_OFFSET + 20].copy_from_slice(&hash);
+    }
 
     let bulk_data_chunk_id = FIoChunkId::from_package_id(builder.package_id, 0, EIoChunkType::BulkData);
     let optional_bulk_data_chunk_id = FIoChunkId::from_package_id(builder.package_id, 0, EIoChunkType::OptionalBulkData);
@@ -1509,6 +1518,24 @@ fn serialize_asset(builder: &LegacyAssetBuilder, include_bulk_data: bool) -> any
         optional_bulk_data_buffer,
         memory_mapped_bulk_data_buffer,
     })
+}
+
+/// Tagged-property packages (UE 5.2+ file versions): set each export's script serialization range to the
+/// real range of its tagged properties (start 0: UObject::SerializeScriptProperties runs first), as the
+/// engine wrote it and as FLinkerLoad checks it. Exports whose data doesn't parse keep the fallback.
+fn fix_script_serialization_offsets(package: &mut FLegacyPackageHeader, exports_data: &[u8]) {
+    let file_version_ue5 = package.summary.versioning_info.package_file_version.file_version_ue5;
+    if package.summary.uses_unversioned_property_serialization() || file_version_ue5 < EUnrealEngineObjectUE5Version::ScriptSerializationOffset as i32 {
+        return;
+    }
+    for export in &mut package.exports {
+        let (Ok(offset), Ok(size)) = (usize::try_from(export.serial_offset), usize::try_from(export.serial_size)) else { continue };
+        let Some(data) = offset.checked_add(size).and_then(|end| exports_data.get(offset..end)) else { continue };
+        if let Some(end) = crate::legacy_summary_fixups::tagged_properties_end(data, &package.name_map, file_version_ue5) {
+            export.script_serialization_start_offset = 0;
+            export.script_serialization_end_offset = end as i64;
+        }
+    }
 }
 
 // Writes asset to the file. Additionally writes to the uexp file next to it
