@@ -26,6 +26,8 @@ pub struct FZenPackageContext<'a> {
     fallback_package_file_version: Option<FPackageFileVersion>,
     log: &'a Log,
     script_cells: Option<Arc<ZenScriptCellsStore>>,
+    /// Legacy imports get `PackageName` in cooked packages (UE 5.8+).
+    cooked_import_package_names: bool,
 
     inner_state: Arc<RwLock<FZenPackageContextMutableState>>,
     script_objects: Arc<RwLock<Option<FZenPackageContextScriptObjects>>>,
@@ -51,11 +53,18 @@ impl<'a> FZenPackageContext<'a> {
             fallback_package_file_version,
             log,
             script_cells,
+            cooked_import_package_names: false,
             script_objects: Default::default(),
             inner_state: Default::default(),
             package_lookup_locks: KeyMutex::new(),
             package_cell_verse_path_lookup_locks: KeyMutex::new(),
         }
+    }
+    /// The engine the legacy files are for, where the package version alone doesn't tell
+    /// (5.8 writes `PackageName` into cooked imports; 5.7 doesn't, same object version).
+    pub fn with_engine_version(mut self, engine_version: Option<crate::version::EngineVersion>) -> Self {
+        self.cooked_import_package_names = engine_version.is_some_and(|v| v >= crate::version::EngineVersion::UE5_8);
+        self
     }
     fn get_script_objects(&self) -> anyhow::Result<RwLockReadGuard<'_, Option<FZenPackageContextScriptObjects>>> {
         let read_lock = self.script_objects.read().unwrap();
@@ -488,6 +497,7 @@ fn begin_build_summary(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
     legacy_package_summary.package_flags = builder.zen_package.summary.package_flags;
     legacy_package_summary.package_guid = FGuid { a: 0, b: 0, c: 0, d: 0 };
     legacy_package_summary.package_source = 0;
+    legacy_package_summary.cooked_import_package_names = builder.package_context.cooked_import_package_names;
 
     let zen_versions: FZenPackageVersioningInfo = builder.zen_package.versioning_info.clone();
 

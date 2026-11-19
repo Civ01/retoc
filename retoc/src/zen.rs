@@ -46,6 +46,12 @@ pub struct FZenPackageSummary {
     name_map_hashes_size: i32,
     graph_data_size: i32,
 }
+/// Versioning info of a Zen package (`None`: unversioned), read from the start of its data.
+pub fn read_zen_package_versioning_info<S: Read>(s: &mut S, container_header_version: EIoContainerHeaderVersion) -> Result<Option<FZenPackageVersioningInfo>> {
+    let summary = FZenPackageSummary::deserialize(s, container_header_version)?;
+    Ok(if summary.has_versioning_info != 0 { Some(s.de()?) } else { None })
+}
+
 impl FZenPackageSummary {
     #[instrument(skip_all, name = "FZenPackageSummary")]
     fn deserialize<S: Read>(s: &mut S, container_header_version: EIoContainerHeaderVersion) -> Result<Self> {
@@ -248,7 +254,7 @@ impl Readable for FZenPackageVersioningInfo {
     fn de<S: Read>(s: &mut S) -> Result<Self> {
         let zen_version_raw: u32 = s.de()?;
         Ok(Self {
-            zen_version: EZenPackageVersion::from_repr(zen_version_raw).unwrap(),
+            zen_version: EZenPackageVersion::from_repr(zen_version_raw).ok_or_else(|| anyhow::anyhow!("unknown zen package version {zen_version_raw}"))?,
             package_file_version: s.de()?,
             licensee_version: s.de()?,
             custom_versions: s.de()?,

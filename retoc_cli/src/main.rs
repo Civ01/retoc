@@ -700,7 +700,12 @@ fn action_to_legacy_assets(args: &ActionToLegacy, file_writer: &dyn FileWriterTr
     let script_cell_store = build_verse_cell_store(&args.script_cell);
 
     let package_file_version: Option<FPackageFileVersion> = args.version.map(|v| v.package_file_version());
-    let package_context = FZenPackageContext::create(iostore, package_file_version, log, Some(script_cell_store.clone()));
+    // UE 5.8 isn't told apart from 5.7 by package versions; 8-byte shader hashes give it away
+    let engine_version = args.version.or_else(|| {
+        let size = iostore.packages().find_map(|p| p.container().package_store_entry(p.id()).and_then(|e| e.shader_map_hashes.first().map(|h| h.len())));
+        (size == Some(retoc::FShaderHash::UE5_8_SIZE)).then_some(EngineVersion::UE5_8)
+    });
+    let package_context = FZenPackageContext::create(iostore, package_file_version, log, Some(script_cell_store.clone())).with_engine_version(engine_version);
 
     let count = packages_to_extract.len();
     let failed_count = AtomicUsize::new(0);

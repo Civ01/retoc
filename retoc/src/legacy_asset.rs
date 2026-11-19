@@ -262,6 +262,10 @@ pub struct FLegacyPackageFileSummary {
     pub asset_registry_data_offset: i32,
     // not used for cooked packages
     pub bulk_data_start_offset: i64,
+    /// Not serialized. UE 5.8+ writes `PackageName` into the imports of cooked packages too (the
+    /// object name stands in for None; reset on load); earlier engines write it only uncooked. The
+    /// object version is the same (1018) in 5.7 and 5.8, so the caller must say.
+    pub cooked_import_package_names: bool,
 }
 impl FLegacyPackageFileSummary {
     pub const PACKAGE_FILE_TAG: u32 = 0x9E2A83C1;
@@ -421,6 +425,7 @@ impl FLegacyPackageFileSummary {
             data_resource_offset,
             asset_registry_data_offset,
             bulk_data_start_offset,
+            cooked_import_package_names: false,
         })
     }
 
@@ -683,7 +688,7 @@ impl FObjectImport {
 
         // Used to support imports that live in their own packages for One File Per Actor in UE5
         // Such imports cannot exist in cooked data, and as such, we should never encounter them
-        if !summary.is_filter_editor_only() {
+        if !summary.is_filter_editor_only() || summary.cooked_import_package_names {
             let _package_name: FMinimalName = s.de()?;
         }
 
@@ -710,6 +715,9 @@ impl FObjectImport {
         if !summary.is_filter_editor_only() {
             let package_name: FMinimalName = FMinimalName::default();
             s.ser(&package_name)?;
+        } else if summary.cooked_import_package_names {
+            // UE 5.8 cooked: ObjectName in place of a None PackageName (see ObjectResource.cpp)
+            s.ser(&self.object_name)?;
         }
 
         let should_serialize_optional = summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::OptionalResources as i32;
