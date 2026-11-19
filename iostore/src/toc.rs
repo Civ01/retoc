@@ -33,6 +33,8 @@ pub struct TocHeader {
     /// As stored (0 before `PartitionSize`).
     pub partition_size: u64,
     pub chunks_without_perfect_hash_count: u32,
+    /// The header as stored (reserved bytes kept for writing it back).
+    pub raw: [u8; TOC_HEADER_SIZE as usize],
 }
 
 impl TocHeader {
@@ -70,6 +72,9 @@ pub struct ChunkMeta {
     /// Hash of the uncompressed chunk. Only the first 20 bytes are meaningful.
     pub hash: [u8; 20],
     pub flags: u8,
+    /// Bytes 20..32 of the 32-byte `FIoChunkHash` (TOC < 8), or the 3 padding bytes after the
+    /// flags (TOC 8), as stored. Zero in new entries.
+    pub rest: [u8; 12],
 }
 
 impl ChunkMeta {
@@ -170,6 +175,7 @@ impl TocHeader {
             perfect_hash_seed_count: u32_at(data, 84),
             partition_size: u64_at(data, 88),
             chunks_without_perfect_hash_count: u32_at(data, 96),
+            raw: data[..TOC_HEADER_SIZE as usize].try_into().unwrap(),
         };
         if h.header_size != TOC_HEADER_SIZE {
             return Err(corrupt(format!("TOC header size {:#x}, expected {:#x}", h.header_size, TOC_HEADER_SIZE)));
@@ -254,9 +260,18 @@ impl Toc {
         let meta = c.table(header.entry_count, meta_size, "chunk meta table")?;
         let metas = meta
             .chunks_exact(meta_size)
-            .map(|m| ChunkMeta {
-                hash: m[0..20].try_into().unwrap(),
-                flags: if meta_size == 24 { m[20] } else { m[32] },
+            .map(|m| {
+                let mut rest = [0u8; 12];
+                if meta_size == 24 {
+                    rest[..3].copy_from_slice(&m[21..24]);
+                } else {
+                    rest.copy_from_slice(&m[20..32]);
+                }
+                ChunkMeta {
+                    hash: m[0..20].try_into().unwrap(),
+                    flags: if meta_size == 24 { m[20] } else { m[32] },
+                    rest,
+                }
             })
             .collect();
 
@@ -312,6 +327,96 @@ impl Toc {
         let first = ol.offset / bs;
         let last = (ol.offset + ol.length - 1) / bs;
         first as u32..last as u32 + 1
+    }
+}
+
+impl TocHeader {
+    /// The header as written by [`Toc::serialize`]: `raw` with every known field set from the
+    /// struct (so reserved bytes survive), counts taken from `toc`.
+    fn serialize(&self, toc: &Toc) -> [u8; TOC_HEADER_SIZE as usize] {
+        let mut h = self.raw;
+        let put32 = |h: &mut [u8; 144], o: usize, v: u32| h[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        h[..16].copy_from_slice(&self.magic);
+        h[16] = self.version.0;
+        put32(&mut h, 20, TOC_HEADER_SIZE);
+        put32(&mut h, 24, toc.chunk_ids.len() as u32);
+        put32(&mut h, 28, toc.blocks.len() as u32);
+        put32(&mut h, 32, BLOCK_ENTRY_SIZE);
+        put32(&mut h, 36, toc.compression_methods.len() as u32);
+        put32(&mut h, 40, self.compression_method_name_length);
+        put32(&mut h, 44, self.block_size);
+        put32(&mut h, 48, toc.directory_index.len() as u32);
+        put32(&mut h, 52, self.partition_count);
+        h[56..64].copy_from_slice(&self.container_id.0.to_le_bytes());
+        h[64..80].copy_from_slice(&self.key_guid.0);
+        h[80] = self.flags.0;
+        put32(&mut h, 84, toc.perfect_hash_seeds.len() as u32);
+        h[88..96].copy_from_slice(&self.partition_size.to_le_bytes());
+        put32(&mut h, 96, toc.chunks_without_perfect_hash.len() as u32);
+        h
+    }
+}
+
+impl Toc {
+    /// Writes the `.utoc` back. `parse` then `serialize` gives the same bytes; the signature
+    /// section is written only while the header says signed (clear the flag to drop it).
+    pub fn serialize(&self) -> Vec<u8> {
+        let v = self.header.version;
+        let mut out = Vec::with_capacity(TOC_HEADER_SIZE as usize + self.chunk_ids.len() * 50 + self.blocks.len() * 12 + self.directory_index.len());
+        out.extend_from_slice(&self.header.serialize(self));
+        for id in &self.chunk_ids {
+            out.extend_from_slice(&id.0);
+        }
+        for ol in &self.offsets {
+            out.extend_from_slice(&ol.offset.to_be_bytes()[3..]);
+            out.extend_from_slice(&ol.length.to_be_bytes()[3..]);
+        }
+        if v >= TocVersion::PERFECT_HASH {
+            for s in &self.perfect_hash_seeds {
+                out.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        if v >= TocVersion::PERFECT_HASH_WITH_OVERFLOW {
+            for s in &self.chunks_without_perfect_hash {
+                out.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        for b in &self.blocks {
+            out.extend_from_slice(&b.offset.to_le_bytes()[..5]);
+            out.extend_from_slice(&b.compressed_size.to_le_bytes()[..3]);
+            out.extend_from_slice(&b.uncompressed_size.to_le_bytes()[..3]);
+            out.push(b.method);
+        }
+        let name_len = self.header.compression_method_name_length as usize;
+        for name in &self.compression_methods {
+            let mut n = name.as_bytes().to_vec();
+            n.resize(name_len, 0);
+            out.extend_from_slice(&n);
+        }
+        if self.header.flags.signed()
+            && let Some(s) = &self.signatures
+        {
+            out.extend_from_slice(&s.hash_size.to_le_bytes());
+            out.extend_from_slice(&s.toc_signature);
+            out.extend_from_slice(&s.block_signature);
+            for h in &s.block_hashes {
+                out.extend_from_slice(h);
+            }
+        }
+        if v >= TocVersion::DIRECTORY_INDEX {
+            out.extend_from_slice(&self.directory_index);
+        }
+        for m in &self.metas {
+            out.extend_from_slice(&m.hash);
+            if v >= TocVersion::REPLACE_IO_CHUNK_HASH_WITH_IO_HASH {
+                out.push(m.flags);
+                out.extend_from_slice(&m.rest[..3]);
+            } else {
+                out.extend_from_slice(&m.rest);
+                out.push(m.flags);
+            }
+        }
+        out
     }
 }
 

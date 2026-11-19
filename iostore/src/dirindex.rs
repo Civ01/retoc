@@ -76,6 +76,7 @@ impl R<'_> {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Dir {
     name: u32,
     first_child: u32,
@@ -83,6 +84,7 @@ struct Dir {
     first_file: u32,
 }
 
+#[derive(Debug, Clone)]
 struct File {
     name: u32,
     next: u32,
@@ -177,6 +179,161 @@ impl DirectoryIndex {
         }
         Ok(Self { mount_point, files: out })
     }
+}
+
+/// `FIoDirectoryIndexWriter`: same entry order as UE, so feeding files in TOC entry order (as
+/// `FIoStoreWriter` does) gives UE's bytes.
+#[derive(Debug, Clone)]
+pub struct DirectoryIndexWriter {
+    mount_point: String,
+    dirs: Vec<Dir>,
+    files: Vec<File>,
+    strings: Vec<String>,
+    string_index: std::collections::HashMap<String, u32>,
+}
+
+impl DirectoryIndexWriter {
+    pub fn new(mount_point: impl Into<String>) -> Self {
+        Self {
+            mount_point: mount_point.into(),
+            dirs: vec![Dir {
+                name: NONE,
+                first_child: NONE,
+                next_sibling: NONE,
+                first_file: NONE,
+            }],
+            files: Vec::new(),
+            strings: Vec::new(),
+            string_index: std::collections::HashMap::new(),
+        }
+    }
+
+    fn name_index(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.string_index.get(s) {
+            return i;
+        }
+        let i = self.strings.len() as u32;
+        self.strings.push(s.to_string());
+        self.string_index.insert(s.to_string(), i);
+        i
+    }
+
+    fn directory(&mut self, name: &str, parent: u32) -> u32 {
+        let name = self.name_index(name);
+        let mut d = self.dirs[parent as usize].first_child;
+        while d != NONE {
+            if self.dirs[d as usize].name == name {
+                return d;
+            }
+            d = self.dirs[d as usize].next_sibling;
+        }
+        let new = self.dirs.len() as u32;
+        let sibling = self.dirs[parent as usize].first_child;
+        self.dirs.push(Dir {
+            name,
+            first_child: NONE,
+            next_sibling: sibling,
+            first_file: NONE,
+        });
+        self.dirs[parent as usize].first_child = new;
+        new
+    }
+
+    /// Adds `path` (relative to the mount point, `/`-separated) pointing at TOC entry `toc_index`.
+    pub fn add_file(&mut self, path: &str, toc_index: u32) {
+        let (dir_path, file_name) = match path.rfind('/') {
+            Some(i) => (&path[..i], &path[i + 1..]),
+            None => ("", path),
+        };
+        let mut dir = 0;
+        for part in dir_path.split('/').filter(|p| !p.is_empty()) {
+            dir = self.directory(part, dir);
+        }
+        let name = self.name_index(file_name);
+        let new = self.files.len() as u32;
+        let next = self.dirs[dir as usize].first_file;
+        self.files.push(File { name, next, user_data: toc_index });
+        self.dirs[dir as usize].first_file = new;
+    }
+
+    /// The index as stored, unencrypted (see [`encrypt_directory_index`]).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_fstring(&mut out, &self.mount_point);
+        out.extend((self.dirs.len() as u32).to_le_bytes());
+        for d in &self.dirs {
+            for v in [d.name, d.first_child, d.next_sibling, d.first_file] {
+                out.extend(v.to_le_bytes());
+            }
+        }
+        out.extend((self.files.len() as u32).to_le_bytes());
+        for f in &self.files {
+            for v in [f.name, f.next, f.user_data] {
+                out.extend(v.to_le_bytes());
+            }
+        }
+        out.extend((self.strings.len() as u32).to_le_bytes());
+        for s in &self.strings {
+            write_fstring(&mut out, s);
+        }
+        out
+    }
+}
+
+/// `FString` serialization: ANSI when every character is ASCII, else UTF-16 (negative length).
+fn write_fstring(out: &mut Vec<u8>, s: &str) {
+    if s.is_empty() {
+        out.extend(0i32.to_le_bytes());
+    } else if s.is_ascii() {
+        out.extend(((s.len() + 1) as i32).to_le_bytes());
+        out.extend(s.as_bytes());
+        out.push(0);
+    } else {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        out.extend((-((units.len() + 1) as i32)).to_le_bytes());
+        for u in units {
+            out.extend(u.to_le_bytes());
+        }
+        out.extend([0, 0]);
+    }
+}
+
+/// `FIoDirectoryIndexWriter::Flush` for encrypted containers: pad to 16 bytes by repeating the
+/// start of the buffer, then AES-ECB.
+pub fn encrypt_directory_index(mut data: Vec<u8>, key: &crate::crypto::AesKey) -> Vec<u8> {
+    let len = data.len();
+    if !len.is_multiple_of(16) {
+        for i in len..len.next_multiple_of(16) {
+            data.push(data[(i - len) % len]);
+        }
+    }
+    key.encrypt_ecb(&mut data);
+    data
+}
+
+/// `IoDirectoryIndexUtils::GetCommonRootPath`: longest common directory of `paths`, with a
+/// trailing `/` (UE's mount point for a new container).
+pub fn common_root_path<'a>(paths: impl IntoIterator<Item = &'a str>) -> String {
+    let mut root: Option<&str> = None;
+    for p in paths {
+        let dir = match p.rfind('/') {
+            Some(i) => &p[..=i],
+            None => "",
+        };
+        root = Some(match root {
+            None => dir,
+            Some(r) => {
+                // Case-insensitive, as UE's Strnicmp.
+                let common = r.char_indices().zip(dir.chars()).take_while(|((_, a), b)| a.eq_ignore_ascii_case(b)).last().map(|((i, c), _)| i + c.len_utf8()).unwrap_or(0);
+                // Back to the last whole directory.
+                match r[..common].rfind('/') {
+                    Some(i) => &r[..=i],
+                    None => "",
+                }
+            }
+        });
+    }
+    root.unwrap_or("").to_string()
 }
 
 #[cfg(test)]

@@ -295,6 +295,24 @@ impl Container {
         kinds.contains(&ChunkKind::ScriptObjects) || (kinds.contains(&ChunkKind::LoaderInitialLoadMeta) && kinds.contains(&ChunkKind::LoaderGlobalNames))
     }
 
+    /// A block's bytes as stored in the `.ucas` (padded to 16, still encrypted if the container
+    /// is): what a rebuild copies without recompressing.
+    pub fn read_raw_block(&self, block: u32) -> Result<Vec<u8>> {
+        let e = *self.toc.blocks.get(block as usize).ok_or_else(|| corrupt(format!("block {block} out of range")))?;
+        let psize = self.toc.header.effective_partition_size();
+        let (part, poff) = if psize == u64::MAX { (0, e.offset) } else { ((e.offset / psize) as usize, e.offset % psize) };
+        let p = self.partitions.get(part).ok_or_else(|| corrupt(format!("block {block} is in partition {part}, but there are {}", self.partitions.len())))?;
+        let file = p.file.as_ref().ok_or_else(|| Error::MissingPartition(p.path.clone()))?;
+        let mut raw = vec![0u8; align16(e.compressed_size as u64) as usize];
+        read_exact_at(file, &mut raw, poff)?;
+        Ok(raw)
+    }
+
+    /// The key set with [`Container::set_key`].
+    pub fn key(&self) -> Option<&AesKey> {
+        self.key.as_ref()
+    }
+
     fn decode_block(&self, chunk: u32, block: u32, raw: &mut Vec<u8>, out: &mut Vec<u8>) -> Result<()> {
         let e = self.toc.blocks[block as usize];
         let psize = self.toc.header.effective_partition_size();

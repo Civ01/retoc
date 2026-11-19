@@ -45,6 +45,15 @@ pub enum Error {
 
     #[error("chunk index {0} out of range")]
     NoSuchChunk(u32),
+
+    #[error("compression failed: {0}")]
+    Compress(String),
+
+    #[error("cancelled")]
+    Cancelled,
+
+    #[error("{0}")]
+    Write(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

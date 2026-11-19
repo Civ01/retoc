@@ -129,3 +129,99 @@ fn every_chunk_of_every_sample() {
     }
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }
+
+#[test]
+fn toc_round_trips_byte_for_byte() {
+    let Some(root) = std::env::var_os("IOSTORE_SAMPLES") else {
+        eprintln!("IOSTORE_SAMPLES not set: skipped");
+        return;
+    };
+    let mut files = Vec::new();
+    utocs(Path::new(&root), &mut files);
+    assert!(!files.is_empty());
+    let mut failed = Vec::new();
+    for f in &files {
+        let data = std::fs::read(f).unwrap();
+        let toc = iostore::Toc::parse(&data, &iostore::Vanilla).unwrap();
+        let out = toc.serialize();
+        if out != data {
+            let at = out.iter().zip(&data).position(|(a, b)| a != b).unwrap_or(out.len().min(data.len()));
+            failed.push(format!("{}: differs at {at} (len {} vs {})", f.display(), out.len(), data.len()));
+        }
+    }
+    eprintln!("{} TOCs checked", files.len());
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+#[test]
+fn perfect_hash_lookup_and_generation() {
+    let Some(root) = std::env::var_os("IOSTORE_SAMPLES") else {
+        eprintln!("IOSTORE_SAMPLES not set: skipped");
+        return;
+    };
+    let mut files = Vec::new();
+    utocs(Path::new(&root), &mut files);
+    let (mut with_seeds, mut same) = (0, 0);
+    for f in &files {
+        let data = std::fs::read(f).unwrap();
+        let toc = iostore::Toc::parse(&data, &iostore::Vanilla).unwrap();
+        if toc.perfect_hash_seeds.is_empty() {
+            continue;
+        }
+        with_seeds += 1;
+        // Our lookup resolves every chunk with the TOC's own seeds.
+        for (i, id) in toc.chunk_ids.iter().enumerate() {
+            assert_eq!(iostore::perfect_hash::lookup(&toc.chunk_ids, &toc.perfect_hash_seeds, &toc.chunks_without_perfect_hash, id), Some(i as u32), "{}: chunk {i}", f.display());
+        }
+        // Our table for the same chunks resolves every chunk too.
+        let ph = iostore::perfect_hash::generate(&toc.chunk_ids);
+        let table: Vec<_> = ph.order.iter().map(|&i| toc.chunk_ids[i as usize]).collect();
+        for (i, id) in toc.chunk_ids.iter().enumerate() {
+            let slot = iostore::perfect_hash::lookup(&table, &ph.seeds, &ph.overflow, id).unwrap_or_else(|| panic!("{}: chunk {i} not found", f.display()));
+            assert_eq!(ph.order[slot as usize], i as u32);
+        }
+        if ph.seeds == toc.perfect_hash_seeds && table == toc.chunk_ids {
+            same += 1;
+        }
+    }
+    eprintln!("{with_seeds} TOCs with perfect hashes, {same} regenerated identically");
+}
+
+#[test]
+fn directory_index_rebuilds_byte_for_byte() {
+    let Some(root) = std::env::var_os("IOSTORE_SAMPLES") else {
+        eprintln!("IOSTORE_SAMPLES not set: skipped");
+        return;
+    };
+    let mut list = Vec::new();
+    utocs(Path::new(&root), &mut list);
+    let (mut checked, mut failed) = (0, Vec::new());
+    for utoc in &list {
+        let mut c = Container::open(utoc, Arc::new(Vanilla)).unwrap();
+        let key = std::fs::read_to_string(utoc.with_file_name("key.txt")).ok().and_then(|t| find_key(&t)).map(AesKey::new);
+        if c.is_encrypted() {
+            c.set_key(key.clone().expect("key")).unwrap();
+        }
+        let raw = c.toc().directory_index.clone();
+        if raw.is_empty() {
+            continue;
+        }
+        let idx = c.directory_index().unwrap().clone();
+        let mut files = idx.files.clone();
+        files.sort_by_key(|f| f.toc_index);
+        let mut w = iostore::DirectoryIndexWriter::new(idx.mount_point.clone());
+        for f in &files {
+            w.add_file(&f.path, f.toc_index);
+        }
+        let mut out = w.serialize();
+        if c.is_encrypted() {
+            out = iostore::encrypt_directory_index(out, key.as_ref().unwrap());
+        }
+        checked += 1;
+        if out != raw {
+            failed.push(format!("{}: {} vs {} bytes", utoc.display(), out.len(), raw.len()));
+        }
+    }
+    eprintln!("{checked} directory indexes rebuilt");
+    assert!(failed.is_empty(), "{failed:#?}");
+}
