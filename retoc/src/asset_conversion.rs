@@ -1,8 +1,8 @@
 use crate::container_header::EIoContainerHeaderVersion;
 use crate::iostore::IoStoreTrait;
 use crate::legacy_asset::{
-    CLASS_CLASS_NAME, CORE_OBJECT_PACKAGE_NAME, ENUM_CLASS_NAME, FCellExport, FCellImport, FLegacyPackageFileSummary, FLegacyPackageHeader, FLegacyPackageVersioningInfo, FObjectDataResource, FObjectExport, FMinimalName, FObjectImport, FPackageNameMap, FSerializedAssetBundle, FUNCTION_CLASS_NAME, OBJECT_CLASS_NAME, PACKAGE_CLASS_NAME,
-    PRESTREAM_PACKAGE_CLASS_NAME, SCRIPT_STRUCT_CLASS_NAME,
+    CLASS_CLASS_NAME, CORE_OBJECT_PACKAGE_NAME, ENUM_CLASS_NAME, FCellExport, FCellImport, FLegacyPackageFileSummary, FLegacyPackageHeader, FLegacyPackageVersioningInfo, FMinimalName, FObjectDataResource, FObjectExport, FObjectImport, FPackageNameMap, FSerializedAssetBundle, FUNCTION_CLASS_NAME,
+    OBJECT_CLASS_NAME, PACKAGE_CLASS_NAME, PRESTREAM_PACKAGE_CLASS_NAME, SCRIPT_STRUCT_CLASS_NAME,
 };
 use crate::logging::Log;
 use crate::name_map::FMappedName;
@@ -776,9 +776,7 @@ fn is_plain_uclass(builder: &LegacyAssetBuilder, class_index: FPackageIndex) -> 
     let names = &builder.legacy_package.name_map;
     let Some(import) = builder.legacy_package.imports.get(class_index.to_import_index() as usize) else { return false };
     let is = |name: FMinimalName, value: &str| names.get(name).is_ok_and(|n| n == value);
-    is(import.object_name, CLASS_CLASS_NAME)
-        && import.outer_index.is_import()
-        && builder.legacy_package.imports.get(import.outer_index.to_import_index() as usize).is_some_and(|outer| is(outer.object_name, CORE_OBJECT_PACKAGE_NAME))
+    is(import.object_name, CLASS_CLASS_NAME) && import.outer_index.is_import() && builder.legacy_package.imports.get(import.outer_index.to_import_index() as usize).is_some_and(|outer| is(outer.object_name, CORE_OBJECT_PACKAGE_NAME))
 }
 fn build_export_map(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
     builder.legacy_package.exports.reserve(builder.zen_package.export_map.len());
@@ -819,10 +817,7 @@ fn build_export_map(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
         // Not used by the runtime loader and not preserved by zen, but read by tools and by editors loading cooked content.
         // UObject::IsAsset: public, not a CDO, not transient, outer is the package. UClass::IsAsset is false, but
         // Blueprint-generated (and Verse) classes override it back, and only those can be exports of a cooked package.
-        let is_asset = zen_export.outer_index.is_null()
-            && (object_flags & (EObjectFlags::Public as u32)) != 0
-            && (object_flags & ((EObjectFlags::ClassDefaultObject as u32) | (EObjectFlags::Transient as u32))) == 0
-            && !is_plain_uclass(builder, class_index);
+        let is_asset = zen_export.outer_index.is_null() && (object_flags & (EObjectFlags::Public as u32)) != 0 && (object_flags & ((EObjectFlags::ClassDefaultObject as u32) | (EObjectFlags::Transient as u32))) == 0 && !is_plain_uclass(builder, class_index);
         // This is false for all objects in the engine presently, but we can infer if it should be true: If export is not marked as RF_Public still has an export hash, generate_public_hash must be true
         // Note that this property did not exist before UE5.0, so it is always false on earlier versions
         let generate_public_hash = builder.zen_package.container_header_version >= EIoContainerHeaderVersion::LocalizedPackages && (object_flags & (EObjectFlags::Public as u32)) == 0 && zen_export.is_public_export();
@@ -1495,7 +1490,13 @@ fn serialize_asset(builder: &LegacyAssetBuilder, include_bulk_data: bool) -> any
 
     let store_access: &dyn IoStoreTrait = builder.package_context.store_access;
     if !include_bulk_data {
-        return Ok(FSerializedAssetBundle { asset_file_buffer, exports_file_buffer, bulk_data_buffer: None, optional_bulk_data_buffer: None, memory_mapped_bulk_data_buffer: None });
+        return Ok(FSerializedAssetBundle {
+            asset_file_buffer,
+            exports_file_buffer,
+            bulk_data_buffer: None,
+            optional_bulk_data_buffer: None,
+            memory_mapped_bulk_data_buffer: None,
+        });
     }
     let bulk_data_buffer = if store_access.has_chunk_id(bulk_data_chunk_id) { Some(store_access.read(bulk_data_chunk_id)?) } else { None };
     let optional_bulk_data_buffer = if store_access.has_chunk_id(optional_bulk_data_chunk_id) { Some(store_access.read(optional_bulk_data_chunk_id)?) } else { None };
@@ -1564,7 +1565,12 @@ mod script_import_class_tests {
     use super::*;
 
     fn import(class_name: &str, object_name: &str, outer: Option<ResolvedZenImport>) -> ResolvedZenImport {
-        ResolvedZenImport { class_package: CORE_OBJECT_PACKAGE_NAME.to_string(), class_name: class_name.to_string(), object_name: object_name.to_string(), outer: outer.map(Box::new) }
+        ResolvedZenImport {
+            class_package: CORE_OBJECT_PACKAGE_NAME.to_string(),
+            class_name: class_name.to_string(),
+            object_name: object_name.to_string(),
+            outer: outer.map(Box::new),
+        }
     }
 
     // Cases from the engine's own cook of BP_SML (UE 5.8) plus engine enums without an E prefix.
