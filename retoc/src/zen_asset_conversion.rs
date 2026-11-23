@@ -106,6 +106,18 @@ fn create_asset_builder<'a>(
     }
 }
 
+/// The Zen summary's `_Unused` value for a legacy package (see `setup_zen_package_summary`).
+fn cooked_header_size_field(summary: &FLegacyPackageFileSummary, import_count: usize) -> u32 {
+    let mut size = summary.versioning_info.total_header_size as i64;
+    if summary.versioning_info.package_file_version.file_version_ue5 >= crate::zen::EUnrealEngineObjectUE5Version::ImportTypeHierarchies as i32 {
+        size -= 8;
+    }
+    if summary.cooked_import_package_names {
+        size -= 8 * import_count as i64;
+    }
+    size as u32
+}
+
 fn setup_zen_package_summary(builder: &mut ZenPackageBuilder) -> anyhow::Result<()> {
     let is_unversioned = builder.legacy_package.summary.versioning_info.is_unversioned;
 
@@ -147,8 +159,10 @@ fn setup_zen_package_summary(builder: &mut ZenPackageBuilder) -> anyhow::Result<
     // Set package name on the zen package from the legacy package header
     // (deferred to match name map order of editor)
     // builder.zen_package.summary.name = builder.zen_package.name_map.store(&builder.legacy_package.summary.package_name);
-    // Copy size of the cooked header from the legacy package
-    builder.zen_package.summary.cooked_header_size = builder.legacy_package.summary.versioning_info.total_header_size as u32;
+    // `_Unused` (was CookedHeaderSize): UE writes the legacy header size minus what later versions
+    // added to it, to keep patches small (PackageStoreOptimizer.cpp): 8 for the import type
+    // hierarchy fields (5.7+), 8 per import for cooked `PackageName` (5.8+)
+    builder.zen_package.summary.cooked_header_size = cooked_header_size_field(&builder.legacy_package.summary, builder.legacy_package.imports.len());
 
     // Check if this is a localized package, and track the culture and source package name if it is
     if let Some((source_package_name, culture_name)) = convert_localized_package_name_to_source(&builder.legacy_package.summary.package_name) {
@@ -685,75 +699,57 @@ fn build_zen_dependency_bundle_new(builder: &mut ZenPackageBuilder, export_load_
         });
     }
 
-    // Collects all dependencies of the given node with the given command type
-    let collect_export_dependencies = |to_dependency_node: &ZenDependencyGraphNode, from_command_type: EExportCommandType, immut_builder: &ZenPackageBuilder| -> Vec<FDependencyBundleEntry> {
-        let mut result_dependencies: Vec<FDependencyBundleEntry> = Vec::new();
-
-        for from_dependency_node in export_dependencies.get(to_dependency_node).unwrap_or(&Vec::new()) {
-            // Skip nodes that do not have the matching command type, and nodes to ourselves (e.g. serialize depends on create)
-            if from_dependency_node.command_type == from_command_type && from_dependency_node.package_index != to_dependency_node.package_index {
-                // If this is an export, add the dependency bundle entry at all times
-                if from_dependency_node.package_index.is_export() {
-                    result_dependencies.push(FDependencyBundleEntry {
-                        local_import_or_export_index: from_dependency_node.package_index,
-                    });
-                }
-                // Otherwise, if this is an import, we only add it if it's a package export import
-                else if from_dependency_node.package_index.is_import() {
-                    // Note that we are working with "extended" package indices here, where raw import index could refer either to normal import or to cell import
-                    // We need to handle both here separately since both of them are relevant for dependency sorting
-                    let raw_import_index = from_dependency_node.package_index.to_import_index() as usize;
-                    let zen_import_package_index = if raw_import_index < immut_builder.zen_package.import_map.len() {
-                        immut_builder.zen_package.import_map[raw_import_index]
-                    } else {
-                        immut_builder.zen_package.cell_import_map[raw_import_index - immut_builder.zen_package.import_map.len()]
-                    };
-
-                    if zen_import_package_index.kind() == FPackageObjectIndexType::PackageImport {
-                        result_dependencies.push(FDependencyBundleEntry {
-                            local_import_or_export_index: from_dependency_node.package_index,
-                        });
-                    }
+    // Dependency bundles as UE's FPackageStoreOptimizer::ProcessPreloadDependencies builds them: per
+    // export (then per cell export), its legacy preload dependencies in the order create-before-create,
+    // serialize-before-create, create-before-serialize, serialize-before-serialize, unchanged
+    // (self-dependencies and duplicates included), leaving out only script imports
+    let import_count = builder.zen_package.import_map.len();
+    let is_script_import = |b: &ZenPackageBuilder, dep: FPackageIndex| -> bool {
+        if !dep.is_import() {
+            return false;
+        }
+        let i = dep.to_import_index() as usize;
+        let index = if i < import_count { b.zen_package.import_map.get(i) } else { b.zen_package.cell_import_map.get(i - import_count) };
+        index.is_some_and(|x| x.kind() == FPackageObjectIndexType::ScriptImport)
+    };
+    let export_count = builder.legacy_package.exports.len();
+    let total_export_count = export_count + builder.legacy_package.cell_exports.len();
+    for extended_export_index in 0..total_export_count {
+        // (first dependency, [sbs, cbs, sbc, cbc] counts) as stored in the legacy export
+        let (first, counts) = if extended_export_index < export_count {
+            let e = &builder.legacy_package.exports[extended_export_index];
+            (e.first_export_dependency_index, [e.serialize_before_serialize_dependencies, e.create_before_serialize_dependencies, e.serialize_before_create_dependencies, e.create_before_create_dependencies])
+        } else {
+            let e = &builder.legacy_package.cell_exports[extended_export_index - export_count];
+            (e.first_export_dependency_index, [e.serialize_before_serialize_dependencies, e.create_before_serialize_dependencies, 0, 0])
+        };
+        if first < 0 {
+            builder.zen_package.dependency_bundle_headers.push(FDependencyBundleHeader { first_entry_index: -1, ..Default::default() });
+            continue;
+        }
+        let first_entry_index = builder.zen_package.dependency_bundle_entries.len() as i32;
+        // start of each group in the legacy list: sbs, cbs, sbc, cbc follow each other
+        let start = |group: usize| first + counts[..group].iter().sum::<i32>();
+        let mut taken = [0u32; 4];
+        // UE's order: cbc (group 3), sbc (2), cbs (1), sbs (0)
+        for (slot, group) in [3usize, 2, 1, 0].into_iter().enumerate() {
+            for i in 0..counts[group] {
+                let dep = builder.legacy_package.preload_dependencies[(start(group) + i) as usize];
+                if !is_script_import(builder, dep) {
+                    builder.zen_package.dependency_bundle_entries.push(FDependencyBundleEntry { local_import_or_export_index: dep });
+                    taken[slot] += 1;
                 }
             }
         }
-        result_dependencies
-    };
-
-    // Build dependency bundles. Note that we need to build them for both normal exports and cell exports, which together form an "extended" set of package indices
-    let total_export_count = builder.zen_package.export_map.len() + builder.zen_package.cell_export_map.len();
-    for extended_export_index in 0..total_export_count {
-        let export_create_node = ZenDependencyGraphNode {
-            package_index: FPackageIndex::create_export(extended_export_index as u32),
-            command_type: EExportCommandType::Create,
-        };
-        let export_serialize_node = ZenDependencyGraphNode {
-            package_index: FPackageIndex::create_export(extended_export_index as u32),
-            command_type: EExportCommandType::Serialize,
-        };
-
-        let mut create_before_create_deps: Vec<FDependencyBundleEntry> = collect_export_dependencies(&export_create_node, EExportCommandType::Create, builder);
-        let mut serialize_before_create_deps: Vec<FDependencyBundleEntry> = collect_export_dependencies(&export_create_node, EExportCommandType::Serialize, builder);
-        let mut create_before_serialize_deps: Vec<FDependencyBundleEntry> = collect_export_dependencies(&export_serialize_node, EExportCommandType::Create, builder);
-        let mut serialize_before_serialize_deps: Vec<FDependencyBundleEntry> = collect_export_dependencies(&export_serialize_node, EExportCommandType::Serialize, builder);
-
-        // Create dependency header for this export
-        let first_entry_index = builder.zen_package.dependency_bundle_entries.len() as i32;
-
         builder.zen_package.dependency_bundle_headers.push(FDependencyBundleHeader {
             first_entry_index,
-            create_before_create_dependencies: create_before_create_deps.len() as u32,
-            serialize_before_create_dependencies: serialize_before_create_deps.len() as u32,
-            create_before_serialize_dependencies: create_before_serialize_deps.len() as u32,
-            serialize_before_serialize_dependencies: serialize_before_serialize_deps.len() as u32,
+            create_before_create_dependencies: taken[0],
+            serialize_before_create_dependencies: taken[1],
+            create_before_serialize_dependencies: taken[2],
+            serialize_before_serialize_dependencies: taken[3],
         });
-
-        // Push dependency bundle entries into the zen asset following the first index
-        builder.zen_package.dependency_bundle_entries.append(&mut create_before_create_deps);
-        builder.zen_package.dependency_bundle_entries.append(&mut serialize_before_create_deps);
-        builder.zen_package.dependency_bundle_entries.append(&mut create_before_serialize_deps);
-        builder.zen_package.dependency_bundle_entries.append(&mut serialize_before_serialize_deps);
     }
+    let _ = export_dependencies;
 }
 
 #[derive(PartialEq, Eq, Copy, Clone, Hash)]

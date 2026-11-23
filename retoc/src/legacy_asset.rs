@@ -1041,7 +1041,10 @@ impl FLegacyPackageHeader {
 
         // Deserialize package summary
         let package_summary_offset: u64 = s.stream_position()?;
-        let package_summary: FLegacyPackageFileSummary = FLegacyPackageFileSummary::deserialize(s, Some(package_file_version))?;
+        let mut package_summary: FLegacyPackageFileSummary = FLegacyPackageFileSummary::deserialize(s, Some(package_file_version))?;
+        // UE 5.8 cooked packages carry `PackageName` in each import (no version marks it): the import
+        // map is then 8 bytes per entry longer, which the export map's offset gives away
+        package_summary.cooked_import_package_names = cooked_imports_have_package_names(&package_summary);
 
         // Deserialize name map
         let name_map: FPackageNameMap = FPackageNameMap::read(s, &package_summary)?;
@@ -1269,6 +1272,18 @@ impl FLegacyPackageHeader {
         s.seek(SeekFrom::Start(position_after_writing_header))?;
         Ok(())
     }
+}
+
+/// Whether a cooked package's imports carry `PackageName` (UE 5.8+), from the import map's size:
+/// 4 names/indices (28 bytes) + `bImportOptional` (4, 5.1+) + `PackageName` (8).
+fn cooked_imports_have_package_names(summary: &FLegacyPackageFileSummary) -> bool {
+    if !summary.is_filter_editor_only() || summary.imports.count <= 0 || summary.exports.offset <= summary.imports.offset {
+        return false;
+    }
+    let optional = summary.versioning_info.package_file_version.file_version_ue5 >= EUnrealEngineObjectUE5Version::OptionalResources as i32;
+    let base: i64 = 28 + if optional { 4 } else { 0 };
+    let span = (summary.exports.offset - summary.imports.offset) as i64;
+    span == (base + 8) * summary.imports.count as i64
 }
 
 // Returns package name and package-relative path to the object
