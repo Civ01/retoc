@@ -1142,6 +1142,75 @@ fn build_converted_zen_asset(builder: &ZenPackageBuilder, legacy_asset_bundle: F
     })
 }
 
+/// UE 4.27: where the exports of a cooked Zen package (one the game already has) are, to resolve
+/// the external arcs of packages converted without it (see `fixup_legacy_external_arcs_with`).
+pub struct LegacyExportBundles {
+    /// (public export's global import index, command) → export bundle index
+    map: HashMap<(FPackageObjectIndex, EExportCommandType), i32>,
+    bundle_count: usize,
+}
+
+impl LegacyExportBundles {
+    /// Every export is keyed by the global import index of its path (package name + outer chain,
+    /// lowercase, as importers hash it), public or not: importers may reference subobjects (a
+    /// widget tree, a construction script) that aren't public exports.
+    pub fn from_header(header: &FZenPackageHeader) -> Self {
+        let package = header.source_package_name().to_lowercase();
+        let path_of = |mut i: usize| -> Option<String> {
+            let mut parts = Vec::new();
+            for _ in 0..64 {
+                let e = header.export_map.get(i)?;
+                parts.push(header.name_map.get(e.object_name).to_lowercase());
+                match e.outer_index.export() {
+                    Some(o) => i = o as usize,
+                    None => break,
+                }
+            }
+            parts.reverse();
+            Some(format!("{package}/{}", parts.join("/")))
+        };
+        let keys: Vec<Option<FPackageObjectIndex>> = (0..header.export_map.len())
+            .map(|i| {
+                let e = &header.export_map[i];
+                if e.is_public_export() { Some(e.legacy_global_import_index()) } else { path_of(i).map(|p| FPackageObjectIndex::create_legacy_package_import_from_path(&p)) }
+            })
+            .collect();
+        let mut map = HashMap::new();
+        for (bundle, h) in header.export_bundle_headers.iter().enumerate() {
+            let first = h.first_entry_index as usize;
+            for e in header.export_bundle_entries.iter().skip(first).take(h.entry_count as usize) {
+                if let Some(Some(key)) = keys.get(e.local_export_index as usize) {
+                    map.insert((*key, e.command_type), bundle as i32);
+                }
+            }
+        }
+        LegacyExportBundles { map, bundle_count: header.export_bundle_headers.len() }
+    }
+
+    /// The bundle holding `command` of the imported object: the object itself when it's a public
+    /// export, else its nearest public outer (`full_name`: the lowercase `/`-separated path the
+    /// global import index is hashed from); a package with one bundle has everything in it.
+    pub fn resolve(&self, index: FPackageObjectIndex, command: EExportCommandType, full_name: Option<&str>) -> Option<i32> {
+        if let Some(b) = self.map.get(&(index, command)) {
+            return Some(*b);
+        }
+        if let Some(name) = full_name {
+            let mut path = name;
+            while let Some((outer, _)) = path.rsplit_once('/') {
+                if outer.matches('/').count() < 2 {
+                    break; // reached the package name
+                }
+                let outer_index = FPackageObjectIndex::create_legacy_package_import_from_path(outer);
+                if let Some(b) = self.map.get(&(outer_index, command)) {
+                    return Some(*b);
+                }
+                path = outer;
+            }
+        }
+        (self.bundle_count == 1).then_some(0)
+    }
+}
+
 pub struct ConvertedZenAssetBundle {
     pub package_id: FPackageId,
     pub package_name: String,
@@ -1159,10 +1228,55 @@ pub struct ConvertedZenAssetBundle {
     legacy_export_bundle_mapping_data: Vec<ZenLegacyPackageExportBundleMapping>,
 }
 impl ConvertedZenAssetBundle {
+    /// The Zen package (ExportBundleData chunk).
+    pub fn package_data(&self) -> &[u8] {
+        &self.package_buffer
+    }
+    /// Its container-header store entry.
+    pub fn store_entry(&self) -> &StoreEntry {
+        &self.store_entry
+    }
+    /// Game path given at conversion (`../../../…`).
+    pub fn path(&self) -> &UEPath {
+        &self.path
+    }
+    /// Bulk data chunks: (chunk type, file extension, data).
+    pub fn bulk_data(&self) -> Vec<(EIoChunkType, &'static str, &[u8])> {
+        let mut v = Vec::new();
+        if let Some(b) = &self.bulk_data_buffer {
+            v.push((EIoChunkType::BulkData, "ubulk", b.as_slice()));
+        }
+        if let Some(b) = &self.optional_bulk_data_buffer {
+            v.push((EIoChunkType::OptionalBulkData, "uptnl", b.as_slice()));
+        }
+        if let Some(b) = &self.memory_mapped_bulk_data_buffer {
+            v.push((EIoChunkType::MemoryMappedBulkData, "m.ubulk", b.as_slice()));
+        }
+        v
+    }
+    /// Localized package: (culture, source package name); redirected package: (None, source).
+    pub fn source_package(&self) -> (Option<&str>, Option<&str>) {
+        (self.localized_package_culture_name.as_deref(), self.source_package_name.as_deref())
+    }
     pub fn package_data_size(&self) -> usize {
         self.package_buffer.len()
     }
     pub fn fixup_legacy_external_arcs(&mut self, global_package_lookup: &HashMap<FPackageId, Arc<RwLock<ConvertedZenAssetBundle>>>, log: &Log) -> anyhow::Result<()> {
+        self.fixup_legacy_external_arcs_with(global_package_lookup, &|_, _, _, _| None, log).map(|_| ())
+    }
+
+    /// As [`Self::fixup_legacy_external_arcs`], and an import of a package that wasn't converted
+    /// together is looked up with `external` (imported package, the export's global import index,
+    /// command, the import's full path → its export bundle index in that package, e.g.
+    /// [`LegacyExportBundles::resolve`] over the game's own Zen package). Returns the arcs neither could resolve (written as -1, "the
+    /// package's last export bundle", as before).
+    pub fn fixup_legacy_external_arcs_with(
+        &mut self,
+        global_package_lookup: &HashMap<FPackageId, Arc<RwLock<ConvertedZenAssetBundle>>>,
+        external: &dyn Fn(FPackageId, FPackageObjectIndex, EExportCommandType, Option<&str>) -> Option<i32>,
+        log: &Log,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut unresolved = Vec::new();
         for legacy_serialized_offset in &self.legacy_external_arc_serialized_offsets {
             // Seek to the relevant position and read the ID of the placeholder from bundle index
             let placeholder_from_bundle_index: i32 = {
@@ -1213,8 +1327,11 @@ impl ConvertedZenAssetBundle {
 
                 // We found the export bundle this dependency maps to
                 export_bundle_mapping.export_bundle_index
+            } else if let Some(bundle) = external(fixup_data.from_package_id, fixup_data.from_import_index, fixup_data.from_command_type, fixup_data.debug_full_import_name.as_deref()) {
+                bundle
             } else {
-                // This import is not found in the global package lookup, so assume it is external and use -1 as a value meaning "last export bundle in the package"
+                // Not found anywhere: -1 means "last export bundle in the package"
+                unresolved.push(fixup_data.debug_full_import_name.clone().unwrap_or_else(|| format!("{:?} in {}", fixup_data.from_import_index, fixup_data.from_package_id)));
                 -1
             };
 
@@ -1223,7 +1340,7 @@ impl ConvertedZenAssetBundle {
             package_buffer_writer.seek(SeekFrom::Start(*legacy_serialized_offset))?;
             package_buffer_writer.ser(&result_from_bundle_index)?;
         }
-        Ok(())
+        Ok(unresolved)
     }
 
     // Writes both the package data and the bulk data in one go
